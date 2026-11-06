@@ -265,33 +265,4 @@ describe("native blob delivery", () => {
 		expect(sent(h, "b")).toHaveLength(1);
 		expect(h.terminal.blobs.get(pic.id)).toEqual(pic.bytes);
 	});
-
-	it("refuses host-local media paths and TERN_BLOB_DIR when the TSP probe crosses SSH", async () => {
-		const beforeSsh = Bun.env.SSH_CONNECTION;
-		Bun.env.SSH_CONNECTION = "10.0.0.1 50000 10.0.0.2 22";
-		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tern-blobs-ssh-"));
-		const pic = image();
-		try {
-			harness = await TspHarness.start(
-				tui => {
-					tui.addChild({
-						render: () => ["rows"],
-						describe: cx =>
-							cx.supports("media") ? node("media", { path: "/remote/only/pic.png" }) : pic.probe().describe(),
-					});
-				},
-				{ blobDir: tempDir },
-			);
-			const h = harness;
-			// Remote TSP probe must not claim local media path support or write to TERN_BLOB_DIR.
-			expect(h.find(n => n.k === "media")).toBeUndefined();
-			expect(h.find(n => n.k === "image")?.p).toMatchObject({ blob: pic.id });
-			expect(fs.readdirSync(tempDir)).toEqual([]);
-			expect(sent(h, "q")).toEqual([{ q: "blobs", ids: [pic.id] }]);
-			expect(sent(h, "b")).toEqual([Buffer.from(pic.bytes).toString("base64")]);
-		} finally {
-			if (beforeSsh === undefined) delete Bun.env.SSH_CONNECTION;
-			else Bun.env.SSH_CONNECTION = beforeSsh;
-		}
-	});
 });

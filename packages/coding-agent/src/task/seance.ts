@@ -19,7 +19,7 @@ import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
 import { getBundledAgent } from "./agents";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
-import type { AgentDefinition } from "./types";
+import type { AgentDefinition, SeanceTaskSchemaFields } from "./types";
 
 export interface ResolvedSeanceSource {
 	file: string;
@@ -181,7 +181,7 @@ export const seanceTaskSchemaFields = {
 		"`seance` agent only: session id, id prefix, or .jsonl path to consult; ids resolve across every project's sessions, not just this one.",
 	),
 	"model?": modelSelectorInputSchema,
-};
+} satisfies Required<SeanceTaskSchemaFields>;
 export const seanceTaskGuidance = seanceTaskGuidanceTemplate;
 
 /**
@@ -215,7 +215,7 @@ function validateSeanceFields(
 	if (agent !== SEANCE_AGENT_NAME) {
 		if (item.sourceSession !== undefined)
 			return `\`sourceSession\` is only accepted for the \`${SEANCE_AGENT_NAME}\` agent.`;
-		if (item.model !== undefined) return `\`model\` is only accepted for the \`${SEANCE_AGENT_NAME}\` agent.`;
+		// Elsewhere `model` is the per-call selector, decided by `task.perCallModel` at preflight.
 		return undefined;
 	}
 	// Hidden bundled seance (plan mode, policy) is rejected at spawn; a custom shadow is an ordinary agent.
@@ -248,9 +248,11 @@ export function validateSeanceParams(context: {
 }): string | undefined {
 	const { params, batchEnabled, defaultAgent, seanceAdvertised } = context;
 	if (batchEnabled && params.tasks !== undefined) {
-		if (params.sourceSession !== undefined || params.model !== undefined) {
-			return `Put \`sourceSession\` and \`model\` on the individual \`${SEANCE_AGENT_NAME}\` item inside \`tasks[]\`.`;
+		if (params.sourceSession !== undefined) {
+			const fields = params.model !== undefined ? "`sourceSession` and `model`" : "`sourceSession`";
+			return `Put ${fields} on the individual \`${SEANCE_AGENT_NAME}\` item inside \`tasks[]\`.`;
 		}
+		if (params.model !== undefined) return "Put `model` on the individual items inside `tasks[]`.";
 		for (let index = 0; index < params.tasks.length; index++) {
 			const item = params.tasks[index]!;
 			const label = `Task ${index + 1}${item.name ? ` (\`${item.name}\`)` : ""}`;

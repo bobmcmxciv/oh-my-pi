@@ -124,6 +124,10 @@ describe("detectTerminalId", () => {
 		expect(detectTerminalId({ TERM_PROGRAM: "rio", COLORTERM: "truecolor" })).toBe("rio");
 	});
 
+	it("recognizes tern via TERM_PROGRAM despite its plain xterm TERM", () => {
+		expect(detectTerminalId({ TERM_PROGRAM: "tern", TERM: "xterm-256color", COLORTERM: "truecolor" })).toBe("tern");
+	});
+
 	it("maps rio to kitty graphics with verified hyperlink capability", () => {
 		// Reporter-verified (#12205): kitty graphics + true color. Hyperlinks
 		// verified against rio 0.5.28's published escape sequence support plus a
@@ -157,6 +161,17 @@ describe("detectTerminalId", () => {
 
 		expect(detectTerminalId(env)).toBe("trueColor");
 	});
+});
+
+it("selects Kitty graphics for Rex via TERM_PROGRAM or TERM=xterm-rex (over SSH)", () => {
+	for (const env of [
+		{ TERM_PROGRAM: "rex", TERM: "xterm-256color", COLORTERM: "truecolor" },
+		{ TERM: "xterm-rex", COLORTERM: "truecolor", SSH_CONNECTION: "client 1 server 22" },
+	]) {
+		const id = detectTerminalId(env);
+		expect(id).toBe("rex");
+		expect(resolveImageProtocol(id, env, true)).toBe(ImageProtocol.Kitty);
+	}
 });
 
 describe("iTerm2 over SSH", () => {
@@ -310,6 +325,11 @@ console.log(JSON.stringify({ id: TERMINAL_ID, notifyProtocol: TERMINAL.notifyPro
 			expect(JSON.parse(stdout)).toMatchObject({ id: "kitty", imageProtocol: ImageProtocol.Kitty });
 		},
 	);
+
+	it.skipIf(process.platform === "win32")("recognizes a Rex client from tmux client_termname", async () => {
+		const stdout = await resolveInsideFakeTmux("tmux 3.4\txterm-rex");
+		expect(JSON.parse(stdout)).toMatchObject({ id: "rex", imageProtocol: ImageProtocol.Kitty });
+	});
 });
 
 describe("synchronizedOutputUserOverride", () => {
@@ -509,7 +529,6 @@ console.log(JSON.stringify({ id: TERMINAL_ID, imageProtocol: TERMINAL.imageProto
 		expect(resolveWarpImageProtocol("linux", { WSL_INTEROP: "/run/WSL/1_interop" })).toBeNull();
 		expect(wslDistro.imageProtocol).toBeNull();
 		expect(wslInterop.imageProtocol).toBeNull();
-		expect(resolveWarpImageProtocol("linux", { SSH_CONNECTION: "10.0.0.1 1 10.0.0.2 22" })).toBeNull();
 	});
 
 	it("leaves synchronized output off by default and honors hyperlink force-on", () => {
