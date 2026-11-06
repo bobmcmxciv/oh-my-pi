@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { isRecord, logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { isBunTestRuntime, isRecord, logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
 import {
 	createWorkerHandle,
 	createWorkerSubprocess,
@@ -111,6 +111,7 @@ interface JsSession {
 	pendingShadowRuns: Map<string, PromiseWithResolvers<Extract<WorkerOutbound, { type: "shadow-run" }>>>;
 	ownerIds: Set<string>;
 	hasFallbackOwner: boolean;
+	idleTimer?: NodeJS.Timeout;
 }
 
 interface StartingJsSession extends SessionOwners {
@@ -130,7 +131,42 @@ const lostSessions = new Map<string, Set<string>>();
 // SIGILL/SIGSEGV. Callers that pass a larger per-cell budget still dominate.
 const WORKER_INIT_TIMEOUT_MS = 15_000;
 const WORKER_CLOSE_TIMEOUT_MS = 1_000;
+const DEFAULT_JS_KERNEL_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
 const JS_EVAL_PROCESS_ARG = "__omp_worker_js_eval_process";
+
+function resolveJsKernelIdleTimeoutMs(): number {
+	const envVal = Bun.env.OMP_EVAL_IDLE_TIMEOUT_MS;
+	if (envVal !== undefined) {
+		const parsed = Number(envVal);
+		if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
+	}
+	return isBunTestRuntime() ? 0 : DEFAULT_JS_KERNEL_IDLE_TIMEOUT_MS;
+}
+
+function refreshJsSessionIdleTimer(session: JsSession): void {
+	if (session.idleTimer) {
+		clearTimeout(session.idleTimer);
+		session.idleTimer = undefined;
+	}
+	if (session.state !== "alive") return;
+	if (session.pending.size > 0 || session.pendingSnapshots.size > 0 || session.pendingShadowRuns.size > 0) return;
+	const idleMs = resolveJsKernelIdleTimeoutMs();
+	if (idleMs <= 0) return;
+	const timer = setTimeout(() => {
+		session.idleTimer = undefined;
+		if (
+			session.state !== "alive" ||
+			session.pending.size > 0 ||
+			session.pendingSnapshots.size > 0 ||
+			session.pendingShadowRuns.size > 0
+		) {
+			return;
+		}
+		void killSessionFor(session, new ToolError("JS kernel idle timeout"), { force: false });
+	}, idleMs);
+	timer.unref?.();
+	session.idleTimer = timer;
+}
 const productionWorkerFactories: JsEvalWorkerFactories = {
 	spawnProcess: spawnJsProcess,
 	spawnWorker: spawnBunWorker,
@@ -250,7 +286,7 @@ export async function invokeJsTool(
 		settled: false,
 	};
 	session.pending.set(runId, pending);
-
+	refreshJsSessionIdleTimer(session);
 	const onAbort = (): void => {
 		if (pending.settled) return;
 		pending.aborted = true;
@@ -270,6 +306,7 @@ export async function invokeJsTool(
 	} finally {
 		options.signal?.removeEventListener("abort", onAbort);
 		session.pending.delete(runId);
+		refreshJsSessionIdleTimer(session);
 	}
 
 	if (!isRecord(envelope) || envelope.ok !== true) {
@@ -310,6 +347,7 @@ export async function snapshotVmContext(options: {
 	const id = `snapshot-${Snowflake.next()}`;
 	const deferred = Promise.withResolvers<Extract<WorkerOutbound, { type: "shadow-snapshot" }>>();
 	session.pendingSnapshots.set(id, deferred);
+	refreshJsSessionIdleTimer(session);
 	try {
 		session.worker.send({
 			type: "shadow-snapshot",
@@ -330,6 +368,7 @@ export async function snapshotVmContext(options: {
 		return reply.eligible ? (reply.snapshot ?? null) : null;
 	} finally {
 		session.pendingSnapshots.delete(id);
+		refreshJsSessionIdleTimer(session);
 	}
 }
 
@@ -529,7 +568,7 @@ async function runOnce(
 		settled: false,
 	};
 	session.pending.set(runId, pending);
-
+	refreshJsSessionIdleTimer(session);
 	const onAbort = (): void => {
 		const reason = options.runState.signal?.reason;
 		const abortError = abortReasonError(reason, "Execution aborted");
@@ -599,6 +638,7 @@ async function runOnce(
 	} finally {
 		options.runState.signal?.removeEventListener("abort", onAbort);
 		session.pending.delete(runId);
+		refreshJsSessionIdleTimer(session);
 	}
 }
 
@@ -617,6 +657,7 @@ async function acquireSession(
 		existing.packageEnvironment = snapshot.packageEnvironment;
 		attachSessionOwner(existing, snapshot.sessionId, ownerId);
 		markJsSessionAlive(existing, toolSession, snapshot.packageEnvironment);
+		refreshJsSessionIdleTimer(existing);
 		return existing;
 	}
 	const starting = startingSessions.get(sessionKey);
@@ -697,6 +738,7 @@ async function acquireSession(
 	try {
 		const session = await startup;
 		markJsSessionAlive(session, toolSession, snapshot.packageEnvironment);
+		refreshJsSessionIdleTimer(session);
 		return session;
 	} finally {
 		if (startingSessions.get(sessionKey) === startingSession) startingSessions.delete(sessionKey);
@@ -888,6 +930,10 @@ async function killSessionFor(session: JsSession, error: Error, options: { force
 async function killSession(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {
 	if (session.state === "dead") return;
 	session.state = "dead";
+	if (session.idleTimer) {
+		clearTimeout(session.idleTimer);
+		session.idleTimer = undefined;
+	}
 	for (const toolSession of session.stateSessions) {
 		updateEvalState(toolSession, { language: "js", kernelId: session.kernelId, alive: false });
 	}

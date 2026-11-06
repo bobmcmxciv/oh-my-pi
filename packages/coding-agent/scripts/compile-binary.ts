@@ -71,7 +71,7 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 			compile: {
 				// Bun's process-wide fetch User-Agent default. Any explicit
 				// provider fingerprint (Anthropic/Codex OAuth) still wins.
-				execArgv: [`--user-agent=${USER_AGENT}`],
+				execArgv: ["--smol", `--user-agent=${USER_AGENT}`],
 				...(options.executablePath
 					? { executablePath: options.executablePath }
 					: options.target

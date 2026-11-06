@@ -7,7 +7,7 @@
 import * as path from "node:path";
 import * as url from "node:url";
 import type { TSchema } from "@oh-my-pi/pi-ai";
-import { logger, untilAborted } from "@oh-my-pi/pi-utils";
+import { isBunTestRuntime, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -120,7 +120,20 @@ function createMcpStartupFailure(serverName: string, error: string, source?: Sou
  */
 const RECONNECT_BURST_WINDOW_MS = 30_000;
 const RECONNECT_BURST_LIMIT = 5;
+const DEFAULT_STDIO_IDLE_TIMEOUT_MS = 10 * 60 * 1_000;
 
+function isStdioConfig(config: MCPServerConfig | undefined): boolean {
+	return !config?.type || config.type === "stdio";
+}
+
+function resolveStdioIdleTimeoutMs(): number {
+	const envVal = Bun.env.OMP_MCP_STDIO_IDLE_TIMEOUT_MS;
+	if (envVal !== undefined) {
+		const parsed = Number(envVal);
+		if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
+	}
+	return isBunTestRuntime() ? 0 : DEFAULT_STDIO_IDLE_TIMEOUT_MS;
+}
 /**
  * How {@link MCPManager} paces reconnects after a transport is lost.
  *
@@ -444,7 +457,10 @@ export class MCPManager implements MCPManagerApi {
 	#scopedTools = new Map<string, Map<string, Set<MCPToolScope>>>();
 	/** Bumped whenever any session's view of the tools may have changed; starts above a worker's empty cache (0). */
 	#toolViewsRevision = 1;
-
+	/** Cached tool definitions for stdio servers deferred until first tool call (or parked after idle timeout). */
+	#lazyStdioServers = new Map<string, MCPToolDefinition[]>();
+	/** Idle disconnect timers for connected stdio servers. */
+	#stdioIdleTimers = new Map<string, NodeJS.Timeout>();
 	constructor(
 		private cwd: string,
 		private toolCache: MCPToolCache | null = null,
@@ -947,6 +963,28 @@ export class MCPManager implements MCPManagerApi {
 			// retry schedule still trying to bring back the old one.
 			this.#forgetLostServer(name);
 			this.#serverConfigs.set(name, config);
+			if (isStdioConfig(config) && this.toolCache && !isBunTestRuntime() && Bun.env.OMP_MCP_EAGER_STDIO !== "1") {
+				const cached = await this.toolCache.get(name, config);
+				if (cached && cached.length > 0) {
+					this.#lazyStdioServers.set(name, cached);
+					const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
+						this.reconnectServer(name, options);
+					this.#replaceServerTools(
+						name,
+						DeferredMCPTool.fromTools(
+							name,
+							cached,
+							() => this.waitForConnection(name),
+							sources[name],
+							reconnect,
+							this.#observeToolCall(name),
+						),
+					);
+					connectedServers.add(name);
+					notify({ type: "connected", serverName: name });
+					continue;
+				}
+			}
 			const connectionEpoch = this.#epoch;
 			const connectSignal = this.#connectAbort.signal;
 
@@ -1044,10 +1082,13 @@ export class MCPManager implements MCPManagerApi {
 					const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
 						this.reconnectServer(name, options);
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect, this.#observeToolCall(name));
+					if (isStdioConfig(config)) {
+						this.#lazyStdioServers.set(name, serverTools);
+						this.#armStdioIdleTimer(name);
+					}
 					this.#replaceServerTools(name, customTools);
 					await this.#notifyOwnerToolsChanged();
 					void this.toolCache?.set(name, config, serverTools);
-
 					notify({ type: "connected", serverName: name });
 					void this.#loadServerResourcesAndPrompts(name, connection);
 				})
@@ -1197,11 +1238,15 @@ export class MCPManager implements MCPManagerApi {
 	#observeToolCall(name: string): MCPToolCallObserver {
 		return toolCallId => {
 			const scope = this.#toolCallScopes.get(toolCallId) ?? OWNER_TOOL_SCOPE;
+			this.#clearStdioIdleTimer(name);
 			this.#inFlightToolCalls.set(name, (this.#inFlightToolCalls.get(name) ?? 0) + 1);
 			return async () => {
 				const remaining = (this.#inFlightToolCalls.get(name) ?? 1) - 1;
 				if (remaining > 0) this.#inFlightToolCalls.set(name, remaining);
-				else this.#inFlightToolCalls.delete(name);
+				else {
+					this.#inFlightToolCalls.delete(name);
+					this.#armStdioIdleTimer(name);
+				}
 				// A `list_changed` sent during the call already started this refresh.
 				await this.#toolRefreshes.get(name)?.promise.catch(() => {});
 				this.#grantServerTools(name, scope);
@@ -1402,7 +1447,7 @@ export class MCPManager implements MCPManagerApi {
 				this.#pendingReconnections.has(name)
 			) {
 				status.pending.push(name);
-			} else if (this.#connections.get(name)?.tools !== undefined) {
+			} else if (this.#connections.get(name)?.tools !== undefined || this.#lazyStdioServers.has(name)) {
 				status.connected.push(name);
 			} else {
 				status.failed.push({
@@ -1482,7 +1527,10 @@ export class MCPManager implements MCPManagerApi {
 	 */
 	async waitForConnection(name: string): Promise<MCPServerConnection> {
 		const connection = this.#connections.get(name);
-		if (connection) return connection;
+		if (connection) {
+			this.#armStdioIdleTimer(name);
+			return connection;
+		}
 		const pending = this.#pendingConnections.get(name);
 		if (pending) return pending;
 		// If a reconnection is in flight, wait for it to complete
@@ -1490,6 +1538,10 @@ export class MCPManager implements MCPManagerApi {
 		if (reconnecting) {
 			const result = await reconnecting;
 			if (result) return result;
+		}
+		if (this.#lazyStdioServers.has(name)) {
+			const lazyConn = await this.reconnectServer(name, { manual: true });
+			if (lazyConn) return lazyConn;
 		}
 		throw new Error(`MCP server not connected: ${name}`);
 	}
@@ -1533,7 +1585,7 @@ export class MCPManager implements MCPManagerApi {
 	 * Get all connected server names.
 	 */
 	getConnectedServers(): string[] {
-		return Array.from(this.#connections.keys());
+		return Array.from(new Set([...this.#connections.keys(), ...this.#lazyStdioServers.keys()]));
 	}
 
 	/**
@@ -1576,7 +1628,48 @@ export class MCPManager implements MCPManagerApi {
 	/**
 	 * Disconnect from a specific server.
 	 */
+	#clearStdioIdleTimer(name: string): void {
+		const timer = this.#stdioIdleTimers.get(name);
+		if (timer) {
+			clearTimeout(timer);
+			this.#stdioIdleTimers.delete(name);
+		}
+	}
+
+	#armStdioIdleTimer(name: string): void {
+		this.#clearStdioIdleTimer(name);
+		const config = this.getServerConfig(name);
+		if (!isStdioConfig(config)) return;
+		if (!this.#connections.has(name) || (this.#inFlightToolCalls.get(name) ?? 0) > 0) return;
+		const idleMs = resolveStdioIdleTimeoutMs();
+		if (idleMs <= 0) return;
+		const timer = setTimeout(() => {
+			this.#stdioIdleTimers.delete(name);
+			if ((this.#inFlightToolCalls.get(name) ?? 0) > 0) return;
+			const connection = this.#connections.get(name);
+			const cached = this.#lazyStdioServers.get(name);
+			if (!connection || !cached || cached.length === 0) return;
+			void this.#discardConnection(name, connection).catch(() => {});
+			const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) => this.reconnectServer(name, options);
+			this.#replaceServerTools(
+				name,
+				DeferredMCPTool.fromTools(
+					name,
+					cached,
+					() => this.waitForConnection(name),
+					this.#sources.get(name),
+					reconnect,
+					this.#observeToolCall(name),
+				),
+			);
+		}, idleMs);
+		timer.unref?.();
+		this.#stdioIdleTimers.set(name, timer);
+	}
+
 	async disconnectServer(name: string): Promise<void> {
+		this.#clearStdioIdleTimer(name);
+		this.#lazyStdioServers.delete(name);
 		this.#startupServers.delete(name);
 		this.#startupFailures.delete(name);
 		this.#startupUpdates.delete(name);
@@ -1590,7 +1683,6 @@ export class MCPManager implements MCPManagerApi {
 		this.#forgetLostServer(name);
 		this.#callProvokedToolRefreshes.delete(name);
 		this.#scopedTools.delete(name);
-
 		const connection = this.#connections.get(name);
 
 		const subscribedUris = this.#subscribedResources.get(name);
@@ -1628,11 +1720,11 @@ export class MCPManager implements MCPManagerApi {
 		this.#epoch++;
 		this.#connectAbort.abort();
 		this.#connectAbort = new AbortController();
+		for (const name of this.#stdioIdleTimers.keys()) this.#clearStdioIdleTimer(name);
+		this.#lazyStdioServers.clear();
 		for (const name of this.#lostRemoteServers.keys()) this.#forgetLostServer(name);
 		const promises = Array.from(this.#connections, ([name, connection]) => this.#discardConnection(name, connection));
 		await Promise.allSettled(promises);
-
-		this.#pendingConnections.clear();
 		this.#pendingToolLoads.clear();
 		this.#startupUpdates.clear();
 		this.#startupServers.clear();
@@ -1936,6 +2028,10 @@ export class MCPManager implements MCPManagerApi {
 			const serverTools = await listTools(connection);
 			const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) => this.reconnectServer(name, options);
 			const customTools = MCPTool.fromTools(connection, serverTools, reconnect, this.#observeToolCall(name));
+			if (isStdioConfig(config)) {
+				this.#lazyStdioServers.set(name, serverTools);
+				this.#armStdioIdleTimer(name);
+			}
 			void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#notifyOwnerToolsChanged().catch(error => logger.debug("MCP tools-changed handler failed", { error }));

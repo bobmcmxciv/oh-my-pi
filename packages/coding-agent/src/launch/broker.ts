@@ -53,6 +53,7 @@ import { renderTerminalOutput } from "./terminal-output";
 import { quotePosixArgv } from "../utils/shell-quote";
 
 const DEFAULT_IDLE_GRACE_MS = 3_000;
+const SHARED_HEADLESS_BROWSER_IDLE_MS = 10 * 60 * 1_000;
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_LOG_BYTES = 25 * 1024 * 1024;
 const LOG_READ_BYTES = 2 * 1024 * 1024;
@@ -125,6 +126,7 @@ interface ManagedDaemon {
 	outputOffset: number;
 	readyPattern?: RegExp;
 	restartTimer?: NodeJS.Timeout;
+	idleTimer?: NodeJS.Timeout;
 	consecutiveFailures: number;
 	completionCapable: boolean;
 	pendingCompletions: DaemonCompletionNotification[];
@@ -717,6 +719,7 @@ class DaemonBroker {
 			case "describe": {
 				const record = this.#record(operation.name);
 				await this.#refreshDetached(record);
+				this.#armSharedBrowserIdleTimer(record);
 				return { op: "describe", daemon: record.snapshot, spec: record.spec };
 			}
 			case "shutdown":
@@ -828,6 +831,7 @@ class DaemonBroker {
 		record.snapshot.persist = record.spec.persist;
 		record.snapshot.detached = record.spec.detached;
 		record.snapshot.startedAt = Date.now();
+		this.#armSharedBrowserIdleTimer(record);
 		record.snapshot.readyAt = undefined;
 		record.snapshot.exitedAt = undefined;
 		record.snapshot.exitCode = undefined;
@@ -1128,6 +1132,10 @@ class DaemonBroker {
 		await this.#readDetachedOutput(record, generation);
 		// The output read yields, so a concurrent refresh may settle this generation first.
 		if (generation !== record.generation || settledState(record.snapshot.state)) return;
+		if (record.idleTimer) {
+			clearTimeout(record.idleTimer);
+			record.idleTimer = undefined;
+		}
 		record.process = undefined;
 		record.input = undefined;
 		record.pty = undefined;
@@ -1626,6 +1634,22 @@ class DaemonBroker {
 				});
 			}
 		}
+	}
+
+	#armSharedBrowserIdleTimer(record: ManagedDaemon): void {
+		if (record.spec.name !== "omp.browser.headless") return;
+		if (record.idleTimer) {
+			clearTimeout(record.idleTimer);
+			record.idleTimer = undefined;
+		}
+		if (terminalState(record.snapshot.state)) return;
+		const timer = setTimeout(() => {
+			record.idleTimer = undefined;
+			if (this.#shuttingDown || terminalState(record.snapshot.state)) return;
+			void this.#stopRecord(record, 2_000).catch(() => {});
+		}, SHARED_HEADLESS_BROWSER_IDLE_MS);
+		timer.unref?.();
+		record.idleTimer = timer;
 	}
 
 	#scheduleIdleShutdown(): void {

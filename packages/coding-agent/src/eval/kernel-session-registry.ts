@@ -1,6 +1,6 @@
 import * as path from "node:path";
 
-import { logger } from "@oh-my-pi/pi-utils";
+import { isBunTestRuntime, logger } from "@oh-my-pi/pi-utils";
 import {
 	attachSessionOwner,
 	type CancelledErrorClass,
@@ -144,6 +144,40 @@ export function createKernelSessionRegistry<
 	const replacingSessionKernels = new Map<TSession, { kernel: TKernel; promise: Promise<TKernel> }>();
 	// Kernel each session record's latest started cell ran on; a different live kernel means the old one died.
 	const servedKernels = new WeakMap<TSession, TKernel>();
+	const inFlightCounts = new WeakMap<TSession, number>();
+	const idleTimers = new WeakMap<TSession, NodeJS.Timeout>();
+	const DEFAULT_KERNEL_IDLE_TIMEOUT_MS = 5 * 60 * 1_000;
+
+	function resolveKernelIdleTimeoutMs(): number {
+		const envVal = Bun.env.OMP_EVAL_IDLE_TIMEOUT_MS;
+		if (envVal !== undefined) {
+			const parsed = Number(envVal);
+			if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
+		}
+		return isBunTestRuntime() ? 0 : DEFAULT_KERNEL_IDLE_TIMEOUT_MS;
+	}
+
+	function clearSessionIdleTimer(session: TSession): void {
+		const timer = idleTimers.get(session);
+		if (timer) {
+			clearTimeout(timer);
+			idleTimers.delete(session);
+		}
+	}
+
+	function scheduleSessionIdleShutdown(session: TSession): void {
+		clearSessionIdleTimer(session);
+		if ((inFlightCounts.get(session) ?? 0) > 0 || !isCurrent(session)) return;
+		const idleMs = resolveKernelIdleTimeoutMs();
+		if (idleMs <= 0) return;
+		const timer = setTimeout(() => {
+			idleTimers.delete(session);
+			if ((inFlightCounts.get(session) ?? 0) > 0 || !isCurrent(session) || !session.kernel.isAlive()) return;
+			void shutdownSession(session, false).catch(() => undefined);
+		}, idleMs);
+		timer.unref?.();
+		idleTimers.set(session, timer);
+	}
 
 	const context: KernelSessionRegistryContext<TKernel, TOptions, TSession> = {
 		sessions,
@@ -293,6 +327,7 @@ export function createKernelSessionRegistry<
 	}
 
 	async function shutdownSession(session: TSession, resetting: boolean): Promise<RegistryKernelShutdownResult> {
+		clearSessionIdleTimer(session);
 		const replacement = replacingSessionKernels.get(session)?.promise;
 		let shutdown: Promise<RegistryKernelShutdownResult>;
 		try {
@@ -455,33 +490,44 @@ export function createKernelSessionRegistry<
 			if (inFlight) await inFlight.catch(() => undefined);
 		}
 		const session = await acquireSession(sessionKey, sessionId, cwd, options);
-		throwIfCallerCancelled(options);
-		const kernel = await acquireLiveSessionKernel(session, cwd, options);
-		if (!isCurrent(session, kernel)) throw new descriptor.cancelledErrorClass(false);
-		throwIfCallerCancelled(options);
-		const claimKernelRestartNotice = (): boolean => {
-			const previous = servedKernels.get(session);
-			servedKernels.set(session, kernel);
-			return previous !== undefined && previous !== kernel;
-		};
-		const runOptions = { ...options, cwd, claimKernelRestartNotice };
-		let result: R;
+		clearSessionIdleTimer(session);
+		inFlightCounts.set(session, (inFlightCounts.get(session) ?? 0) + 1);
 		try {
-			result = await descriptor.executeWithKernel(kernel, code, runOptions);
-		} catch (err) {
-			if (
-				descriptor.isCancellation?.(err) ||
-				isCancellationError(err, descriptor.cancelledErrorClass) ||
-				options.signal?.aborted
-			)
-				throw err;
-			if (kernel.isAlive()) throw err;
-			throw new Error(
-				`${descriptor.languageLabel} kernel died during execution; completion is uncertain and the cell was not replayed. The next call will start a fresh kernel.`,
-				{ cause: err },
-			);
+			throwIfCallerCancelled(options);
+			const kernel = await acquireLiveSessionKernel(session, cwd, options);
+			if (!isCurrent(session, kernel)) throw new descriptor.cancelledErrorClass(false);
+			throwIfCallerCancelled(options);
+			const claimKernelRestartNotice = (): boolean => {
+				const previous = servedKernels.get(session);
+				servedKernels.set(session, kernel);
+				return previous !== undefined && previous !== kernel;
+			};
+			const runOptions = { ...options, cwd, claimKernelRestartNotice };
+			let result: R;
+			try {
+				result = await descriptor.executeWithKernel(kernel, code, runOptions);
+			} catch (err) {
+				if (
+					descriptor.isCancellation?.(err) ||
+					isCancellationError(err, descriptor.cancelledErrorClass) ||
+					options.signal?.aborted
+				)
+					throw err;
+				if (kernel.isAlive()) throw err;
+				throw new Error(
+					`${descriptor.languageLabel} kernel died during execution; completion is uncertain and the cell was not replayed. The next call will start a fresh kernel.`,
+					{ cause: err },
+				);
+			}
+			return result;
+		} finally {
+			const nextCount = (inFlightCounts.get(session) ?? 1) - 1;
+			if (nextCount > 0) inFlightCounts.set(session, nextCount);
+			else {
+				inFlightCounts.delete(session);
+				scheduleSessionIdleShutdown(session);
+			}
 		}
-		return result;
 	}
 
 	return { disposeAll, disposeByOwner, executeOnSession, peekLiveKernel, getPresentSession };

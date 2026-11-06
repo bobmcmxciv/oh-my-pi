@@ -2,7 +2,15 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { glob } from "@oh-my-pi/pi-natives";
-import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
+import {
+	isBunTestRuntime,
+	isEnoent,
+	logger,
+	postmortem,
+	ptree,
+	stableStringifyJson,
+	untilAborted,
+} from "@oh-my-pi/pi-utils";
 import { encodeMessageFrame, MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { resolveSyscallTarget } from "../tools/path-utils";
@@ -82,11 +90,18 @@ const INIT_FAILURE_BACKOFF_MS = 3 * 60 * 1000;
 const initFailures = new Map<string, { at: number; message: string }>();
 const READER_EXIT_GRACE_MS = 100;
 
-// Idle timeout configuration (disabled by default)
+// Idle timeout configuration (defaults to 10 minutes in production so large LSPs like tsc --lsp do not stay resident indefinitely)
+const DEFAULT_PRODUCTION_LSP_IDLE_TIMEOUT_MS = 10 * 60 * 1_000;
 let idleTimeoutMs: number | null = null;
 let idleCheckInterval: NodeJS.Timeout | null = null;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
 
+function resolveEffectiveIdleTimeoutMs(cwd: string): number | undefined {
+	if (idleTimeoutMs !== null) return idleTimeoutMs;
+	const configured = getConfig(cwd).idleTimeoutMs;
+	if (configured !== undefined) return configured;
+	return isBunTestRuntime() ? undefined : DEFAULT_PRODUCTION_LSP_IDLE_TIMEOUT_MS;
+}
 // Broker-shared server mode: language servers hosted by the per-project LSP mux
 // daemon, one per connection; a released server lingers for reuse while the mux runs.
 // The newest hold decides; with none it is off, so embedders and tests that drive
@@ -185,11 +200,11 @@ export function isIdleClient(client: LspClient, now: number, timeoutMs: number):
 function hasConfiguredIdleTimeout(client?: LspClient): boolean {
 	if (idleTimeoutMs && idleTimeoutMs > 0) return true;
 	if (client) {
-		const timeoutMs = getConfig(client.cwd).idleTimeoutMs;
+		const timeoutMs = resolveEffectiveIdleTimeoutMs(client.cwd);
 		if (timeoutMs && timeoutMs > 0) return true;
 	}
 	for (const c of clients.values()) {
-		const timeoutMs = getConfig(c.cwd).idleTimeoutMs;
+		const timeoutMs = resolveEffectiveIdleTimeoutMs(c.cwd);
 		if (timeoutMs && timeoutMs > 0) return true;
 	}
 	return false;
@@ -235,7 +250,7 @@ function maybeStopIdleChecker(): void {
 export async function checkIdleClients(): Promise<void> {
 	const now = Date.now();
 	for (const [key, client] of Array.from(clients.entries())) {
-		const timeoutMs = idleTimeoutMs ?? getConfig(client.cwd).idleTimeoutMs;
+		const timeoutMs = resolveEffectiveIdleTimeoutMs(client.cwd);
 		if (timeoutMs && timeoutMs > 0 && isIdleClient(client, now, timeoutMs)) {
 			await shutdownClient(key);
 		}
