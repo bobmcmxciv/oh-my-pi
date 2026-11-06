@@ -1,5 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { listSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
+import { listSessions, sessionDisplayName } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 
 const SESSION_DIR = "/sessions/project";
@@ -86,5 +86,35 @@ describe("session listing scan cache", () => {
 		expect(readSpy).toHaveBeenCalledTimes(1);
 		expect(await listSessions(SESSION_DIR, storage)).toEqual([]);
 		expect(readSpy).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("sessionDisplayName", () => {
+	it("strips gateway-injected XML envelopes from the first-message fallback", async () => {
+		const storage = new MemorySessionStorage();
+		const file = `${SESSION_DIR}/hapi.jsonl`;
+		// HAPI sessions persist the gateway's `<hapi_user_context>` envelope in
+		// front of the real prompt inside the first user message; the header
+		// carries no generated title so the fallback label is exercised.
+		storage.writeTextSync(
+			file,
+			[
+				JSON.stringify({ type: "session", id: "hapi-id", cwd: "/repo", timestamp: "2026-06-27T00:00:00.000Z" }),
+				JSON.stringify({
+					type: "message",
+					message: {
+						role: "user",
+						content:
+							'<hapi_user_context user="admin">\ninjected context\n</hapi_user_context>\n\n我们在 vircs 的项目里继续任务',
+					},
+				}),
+				"",
+			].join("\n"),
+		);
+		const [info] = await listSessions(SESSION_DIR, storage);
+		const name = sessionDisplayName(info!);
+		expect(name).not.toContain("hapi_user_context");
+		expect(name).not.toContain("injected context");
+		expect(name).toContain("我们在 vircs 的项目里继续任务");
 	});
 });

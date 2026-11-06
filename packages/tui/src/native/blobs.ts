@@ -10,7 +10,7 @@
 import * as url from "node:url";
 import type { TspProps } from "@oh-my-pi/pi-wire";
 import { resolveImageOptions } from "../render/render-utils";
-import { getImageDimensions } from "../terminal-capabilities";
+import { getImageDimensions, isSshSession } from "../terminal-capabilities";
 import { node } from "./describe";
 import { imageLinksEnabled, transcriptImageLink } from "../prompt/image-references";
 import type { NativeChild, NativeNode } from "./node";
@@ -100,7 +100,7 @@ export function base64ImageNode(
  * context menu. Empty without a file.
  */
 export function openableImageProps(filePath: string | undefined): Pick<TspProps<"image">, "href" | "actions"> {
-	return filePath ? { href: url.pathToFileURL(filePath).href, actions: { menu: ["open"] } } : {};
+	return filePath && !isSshSession() ? { href: url.pathToFileURL(filePath).href, actions: { menu: ["open"] } } : {};
 }
 
 /**

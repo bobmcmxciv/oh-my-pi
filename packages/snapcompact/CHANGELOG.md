@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `compact()` and `viewWithoutThinking()` now preserve the active `todo` ledger (`ACTIVE TODOS`) and chronological user prompt directives (`USER DIRECTIVES`) in the plain-text summary across multiple compactions and model switches
+
 ## [18.12.4] - 2026-10-20
 
 ### Fixed

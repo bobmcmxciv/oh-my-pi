@@ -4,6 +4,7 @@ import type { TspSpan } from "@oh-my-pi/pi-wire";
 import { span } from "../native/describe";
 import { isNativeRendering } from "../native/state";
 import { fileHyperlink, fileLinkSpan, isHyperlinkEnabled, isNativeLinkEnabled } from "../render/hyperlink";
+import { isSshSession } from "../terminal-capabilities";
 import { blobExtensionForImageMimeType } from "./image-format";
 
 /** Materialized image destination returned by the host blob writer. */
@@ -128,6 +129,7 @@ export function setImageBlobWriter(next: ImageBlobWriterSync): () => void {
  * Renderers caching a linked image key their cache on it.
  */
 export function imageLinksEnabled(): boolean {
+	if (isSshSession()) return false;
 	return isNativeRendering() ? isNativeLinkEnabled() : isHyperlinkEnabled();
 }
 

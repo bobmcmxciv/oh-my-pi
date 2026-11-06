@@ -18,6 +18,8 @@
  * the probe down instead of leaking the subprocess.
  */
 
+import { ptree } from "@oh-my-pi/pi-utils";
+
 /** Wall-clock ceiling for a runtime-availability probe when no smaller bound is supplied. */
 export const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
 
@@ -86,6 +88,7 @@ export async function runBoundedProbe(
 		windowsHide: true,
 		detached,
 	});
+	const pinned = ptree.pinProcess(proc.pid);
 	let timedOut = false;
 	let aborted = false;
 	const killDirectChild = (): void => {
@@ -97,41 +100,23 @@ export async function runBoundedProbe(
 	};
 	const forceKill = (): void => {
 		// Availability probes own no persistent state. Kill their whole process
-		// tree so a shim cannot strand the real interpreter after the bound.
-		if (detached) {
-			try {
-				process.kill(-proc.pid, "SIGKILL");
-				return;
-			} catch (error) {
-				if (typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH") return;
-				// Fall back to the direct child if the group signal is denied.
-			}
+		// tree through the spawn-time pinned handle so a shim cannot strand the
+		// real interpreter after the bound; fall back to the direct child when
+		// no handle could be opened.
+		if (pinned) {
+			void ptree
+				.terminateProcessTree(pinned, { group: detached, gracefulMs: -1, timeoutMs: 1_000 })
+				.then(ok => {
+					if (!ok) killDirectChild();
+				})
+				.catch(killDirectChild);
+		} else if (detached) {
+			void ptree
+				.terminateProcessTree(proc.pid, { group: true, gracefulMs: -1, timeoutMs: 1_000 })
+				.catch(killDirectChild);
 		} else {
-			try {
-				const killer = Bun.spawn(["taskkill.exe", "/PID", String(proc.pid), "/T", "/F"], {
-					stdin: "ignore",
-					stdout: "ignore",
-					stderr: "ignore",
-					windowsHide: true,
-				});
-				const fallback = setTimeout(killDirectChild, 1_000);
-				fallback.unref();
-				void killer.exited.then(
-					exitCode => {
-						clearTimeout(fallback);
-						if (exitCode !== 0) killDirectChild();
-					},
-					() => {
-						clearTimeout(fallback);
-						killDirectChild();
-					},
-				);
-				return;
-			} catch {
-				// taskkill unavailable; at least bound the direct child.
-			}
+			killDirectChild();
 		}
-		killDirectChild();
 	};
 	const timer = setTimeout(() => {
 		timedOut = true;

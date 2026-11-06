@@ -56,7 +56,7 @@ function preview(body: string, expanded: boolean, theme: Theme, tone: "dim" | "t
 }
 
 function receiptColor(outcome: IrcDeliveryReceipt["outcome"]): ToolUIColor {
-	return outcome === "failed" ? "error" : outcome === "revived" ? "warning" : "success";
+	return outcome === "failed" ? "error" : outcome === "revived" || outcome === "queued" ? "warning" : "success";
 }
 
 export function renderAgentWrite(
@@ -321,6 +321,7 @@ const RECEIPT_TONE: Record<IrcDeliveryReceipt["outcome"], TspTone> = {
 	injected: "success",
 	woken: "success",
 	revived: "warning",
+	queued: "warning",
 	failed: "error",
 };
 

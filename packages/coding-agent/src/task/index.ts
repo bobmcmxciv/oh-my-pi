@@ -42,13 +42,19 @@ import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { isScoutSpawnable, type ResolvedSpawnPolicy, resolveSpawnPolicy } from "./spawn-policy";
-import { isBundledSeance, seanceTaskGuidance, seanceTaskSchemaFields, validateSeanceParams } from "./seance";
+import {
+	isBundledSeance,
+	normalizeSeanceTaskFields,
+	seanceTaskGuidance,
+	seanceTaskSchemaFields,
+	validateSeanceParams,
+} from "./seance";
 import { SEANCE_AGENT_NAME } from "./seance-policy";
 import { type AgentDefinition, canSpawnAtDepth, getTaskSchema, type TaskToolSchemaInstance } from "./types";
 import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
-import { AgentRegistry, isResumable } from "../registry/agent-registry";
+import { AgentRegistry, isResumable, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { generateTaskName } from "./name-generator";
@@ -167,22 +173,29 @@ function defaultAgentFor(spawnPolicy: ResolvedSpawnPolicy, planMode: boolean): s
 	return spawnPolicy.allowedAgents?.find(agent => agent !== SEANCE_AGENT_NAME) ?? spawnPolicy.defaultAgent;
 }
 
+/** Agents the caller may actually spawn: disabled agents, policy denies, and plan-mode seance removed. */
+function filterSpawnableAgents(
+	agents: AgentDefinition[],
+	options: Pick<TaskDescriptionOptions, "disabledAgents" | "planMode" | "parentSpawns">,
+): AgentDefinition[] {
+	const spawnPolicy = resolveSpawnPolicy(options.parentSpawns);
+	let filtered =
+		options.disabledAgents.length > 0 ? agents.filter(agent => !options.disabledAgents.includes(agent.name)) : agents;
+	if (!spawnPolicy.enabled) return [];
+	if (spawnPolicy.allowedAgents !== null) {
+		const allowed = new Set(spawnPolicy.allowedAgents);
+		filtered = filtered.filter(agent => allowed.has(agent.name));
+	}
+	if (options.planMode) filtered = filtered.filter(agent => !isBundledSeance(agent));
+	return filtered;
+}
+
 /** Render the tool description from a cached agent list and current settings. */
 function renderDescription(options: TaskDescriptionOptions): string {
 	const spawnPolicy = resolveSpawnPolicy(options.parentSpawns);
 	const spawningDisabled = !spawnPolicy.enabled;
 	const agents = [...options.agents, ...options.sessionAgents];
-	let filteredAgents =
-		options.disabledAgents.length > 0 ? agents.filter(agent => !options.disabledAgents.includes(agent.name)) : agents;
-	if (spawningDisabled) {
-		filteredAgents = [];
-	} else if (spawnPolicy.allowedAgents !== null) {
-		const allowed = new Set(spawnPolicy.allowedAgents);
-		filteredAgents = filteredAgents.filter(agent => allowed.has(agent.name));
-	}
-	if (options.planMode) {
-		filteredAgents = filteredAgents.filter(agent => !isBundledSeance(agent));
-	}
+	const filteredAgents = filterSpawnableAgents(agents, options);
 	const renderedAgents = filteredAgents.map(agent => ({
 		name: agent.name,
 		description: agent.description,
@@ -371,6 +384,11 @@ function planSpawns(
 	seanceAdvertised: boolean,
 ): SpawnPlan | string {
 	const params = repairTaskParams(rawParams as TaskParams);
+	// Providers that cannot omit a member emit `""`/`[]`; blank seance fields count as
+	// unset, so an ordinary task is not rejected over an empty `model` and `seance`
+	// falls back to the source's saved model.
+	normalizeSeanceTaskFields(params);
+	for (const item of params.tasks ?? []) normalizeSeanceTaskFields(item);
 	const error =
 		validateShapeParams(batchEnabled, params) ??
 		validateSpawnParams(params, batchEnabled) ??
@@ -804,22 +822,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	#seanceSchemaFields() {
-		const spawnPolicy = resolveSpawnPolicy(this.session.getSessionSpawns());
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const disabledAgents = cfgTaskDisabledAgents.get(this.session.settings);
-		if (
-			planMode ||
-			!spawnPolicy.enabled ||
-			disabledAgents.includes(SEANCE_AGENT_NAME) ||
-			(spawnPolicy.allowedAgents !== null && !spawnPolicy.allowedAgents.includes(SEANCE_AGENT_NAME))
-		) {
-			return undefined;
-		}
 		const agents =
 			discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
 			this.#discoveredAgents;
 		const sessionAgents = this.session.advertisedSessionAgents?.() ?? this.session.getSessionAgents?.() ?? [];
-		const seanceAgent = [...agents, ...sessionAgents].find(agent => agent.name === SEANCE_AGENT_NAME);
+		// One filter feeds the description roster, the guidance block, and these schema
+		// fields: the tool never advertises a field the matching agent cannot accept.
+		const spawnable = filterSpawnableAgents([...agents, ...sessionAgents], {
+			disabledAgents,
+			planMode,
+			parentSpawns: this.session.getSessionSpawns() ?? "*",
+		});
+		const seanceAgent = spawnable.find(agent => agent.name === SEANCE_AGENT_NAME);
 		return seanceAgent && isBundledSeance(seanceAgent) ? seanceTaskSchemaFields : undefined;
 	}
 
@@ -848,6 +864,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		agentId?: string;
 		detached: boolean;
 	}): SpawnRun {
+		if (spawn.agentId) {
+			const registry = this.session.agentRegistry ?? AgentRegistry.global();
+			registry.registerPending({
+				id: spawn.agentId,
+				displayName: spawn.params.agent ?? this.#defaultAgent(),
+				parentId: this.session.getAgentId?.() ?? MAIN_AGENT_ID,
+				assignment: (spawn.params.task ?? "").trim(),
+			});
+		}
 		return new SpawnRun(
 			this.#permit,
 			run =>
@@ -1129,6 +1154,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const agentId =
 				run?.identity.agentId ?? (await outputManager.allocate(item.name?.trim() || generateTaskName()));
 			const assignment = (item.task ?? "").trim();
+			const registry = this.session.agentRegistry ?? AgentRegistry.global();
+			registry.registerPending({
+				id: agentId,
+				displayName: agentType,
+				parentId: this.session.getAgentId?.() ?? MAIN_AGENT_ID,
+				assignment,
+			});
 			spawns.push({
 				agentId,
 				item,
@@ -1212,6 +1244,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				// An adopted run already executes; without its job nothing would own it.
 				spawn.run?.discard(`background job registration failed: ${message}`);
 				failedSchedules.push(`${spawn.agentId}: ${message}`);
+				(this.session.agentRegistry ?? AgentRegistry.global()).recordTerminal({
+					id: spawn.agentId,
+					displayName: spawn.progress.agent,
+					parentId: this.session.getAgentId?.() ?? MAIN_AGENT_ID,
+					outcome: "failed",
+					error: message,
+				});
 				spawn.progress.status = "failed";
 				settledCount += 1;
 				failedCount += 1;
@@ -1484,6 +1523,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (!permitHeld || runSignal.aborted) {
 					progress.status = "aborted";
 					onSettled?.(true);
+					(this.session.agentRegistry ?? AgentRegistry.global()).recordTerminal({
+						id: agentId,
+						displayName: progress.agent,
+						parentId: this.session.getAgentId?.() ?? MAIN_AGENT_ID,
+						outcome: "aborted",
+						error: "Aborted before execution",
+					});
 					throw new Error("Aborted before execution");
 				}
 				try {

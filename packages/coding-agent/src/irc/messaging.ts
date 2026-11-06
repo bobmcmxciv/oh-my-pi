@@ -58,10 +58,22 @@ export async function executeSend(
 	// Restore parked recipients only when needed; never delay delivery to a live peer.
 	if (!isBroadcast && sessionFileHint) {
 		const recipient = registry.get(to);
-		if (!recipient || recipient.status === "parked") await ensurePersistedRoster(registry, sessionFileHint);
+		if ((!recipient || recipient.status === "parked") && !registry.getPending(to)) {
+			await ensurePersistedRoster(registry, sessionFileHint);
+		}
 	}
 
-	const targets = isBroadcast ? registry.listVisibleTo(senderId).map(ref => ref.id) : [to];
+	const targets = isBroadcast
+		? Array.from(
+				new Set([
+					...registry.listVisibleTo(senderId).map(ref => ref.id),
+					...registry
+						.listPending()
+						.filter(pending => pending.id !== senderId)
+						.map(pending => pending.id),
+				]),
+			)
+		: [to];
 	const suppressRelay = isBroadcast && targets.includes(MAIN_AGENT_ID);
 	const bus = IrcBus.global();
 	const receipts = await Promise.all(
@@ -91,13 +103,18 @@ export async function executeSend(
 	} else {
 		const receipt = receipts[0]!;
 		const recipient = registry.get(to);
+		const terminal = registry.getTerminal(to);
 		const unavailable = !recipient || recipient.status === "aborted" || !recipient.session;
 		text =
 			receipt.outcome === "failed"
-				? `Failed: ${to} ${unavailable ? "is not running" : "could not receive the message"}. ${receipt.error ?? ""}`.trimEnd()
-				: receipt.outcome === "revived"
-					? `Queued for ${to} (was parked; revived).`
-					: `Delivered to ${to}.`;
+				? terminal && unavailable
+					? `Failed: ${receipt.error ?? `Agent "${to}" has already ${terminal.outcome}.`}`.trimEnd()
+					: `Failed: ${to} ${unavailable ? "is not running" : "could not receive the message"}. ${receipt.error ?? ""}`.trimEnd()
+				: receipt.outcome === "queued"
+					? `Queued message for pending agent "${to}" (waiting for concurrency slot).`
+					: receipt.outcome === "revived"
+						? `Queued for ${to} (was parked; revived).`
+						: `Delivered to ${to}.`;
 	}
 	return {
 		content: [{ type: "text", text }],

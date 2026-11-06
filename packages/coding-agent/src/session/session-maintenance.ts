@@ -82,6 +82,8 @@ import { customMessageEntryMessage } from "@oh-my-pi/pi-tui/chat/transcript-entr
 import { computeNonMessageTokens, type NonMessageTokenSource } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import { isCompleteReadResult } from "../tools/read-supersede";
+import { getLatestTodoPhasesFromEntries, USER_TODO_EDIT_CUSTOM_TYPE } from "../tools/todo";
+import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ContextUsageBreakdown, HandoffResult, SessionHandoffOptions } from "./agent-session-types";
@@ -383,6 +385,36 @@ function mergeLlmCompactionPreserveData(
 ): Record<string, unknown> | undefined {
 	const preserveData = { ...hookPreserveData, ...resultPreserveData };
 	return snapcompact.stripPreservedArchive(Object.keys(preserveData).length > 0 ? preserveData : undefined);
+}
+function formatActiveTodoLedger(phases: readonly TodoPhase[]): string | undefined {
+	const tasks = phases.flatMap(phase => phase.tasks);
+	if (tasks.length === 0) return undefined;
+	const completed = tasks.filter(task => task.status === "completed").length;
+	const open = tasks.filter(
+		task => task.status === "pending" || task.status === "in_progress" || task.status === "blocked",
+	).length;
+	const lines: string[] = [`Overall: ${completed}/${tasks.length} done, ${open} open.`];
+	const statusMarker: Record<TodoPhase["tasks"][number]["status"], string> = {
+		pending: " ",
+		in_progress: "/",
+		completed: "x",
+		abandoned: "-",
+		blocked: "!",
+	};
+	for (const phase of phases) {
+		if (phase.tasks.length === 0) continue;
+		lines.push(`# ${phase.name}`);
+		for (const task of phase.tasks) {
+			const suffix =
+				task.status === "in_progress"
+					? " (in progress)"
+					: task.status === "blocked"
+						? ` (blocked${task.blocker ? `: ${task.blocker}` : ""})`
+						: "";
+			lines.push(`- [${statusMarker[task.status]}] ${task.content}${suffix}`);
+		}
+	}
+	return lines.join("\n");
 }
 
 /** Wrap a handoff document as a compaction summary: append the cumulative file-operations tag and derive entry details. */
@@ -3841,7 +3873,25 @@ export class SessionMaintenance {
 		settings: EngineCompactionSettings,
 		pendingTokens: number,
 	): Promise<{ result: snapcompact.CompactionResult; framePayloadBytes: number }> {
-		let result = await snapcompact.compact(preparation, options);
+		const effectiveOptions: snapcompact.Options<AgentMessage> =
+			options.todoState !== undefined
+				? options
+				: (() => {
+						const branch = this.#host.sessionManager.getBranch();
+						const phases = getLatestTodoPhasesFromEntries(branch);
+						const formatted = formatActiveTodoLedger(phases);
+						if (formatted !== undefined) return { ...options, todoState: formatted };
+						const hadTodoEntry = branch.some(
+							entry =>
+								(entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE) ||
+								(entry.type === "message" &&
+									entry.message.role === "toolResult" &&
+									entry.message.toolName === "todo" &&
+									!entry.message.isError),
+						);
+						return hadTodoEntry ? { ...options, todoState: "" } : options;
+					})();
+		let result = await snapcompact.compact(preparation, effectiveOptions);
 		let framePayloadBytes = this.#snapcompactFramePayloadBytes(result);
 		const ctxWindow = this.#model?.contextWindow ?? 0;
 		const frameByteBudget = snapcompact.frameDataBytesBudget(this.#model);
@@ -3873,7 +3923,7 @@ export class SessionMaintenance {
 				targetTokens,
 				maxFrames,
 			});
-			result = await snapcompact.compact(preparation, { ...options, maxFrames });
+			result = await snapcompact.compact(preparation, { ...effectiveOptions, maxFrames });
 			framePayloadBytes = this.#snapcompactFramePayloadBytes(result);
 		}
 		return { result, framePayloadBytes };

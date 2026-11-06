@@ -2009,4 +2009,32 @@ describe("Agent — F3 in-place state mutation", () => {
 		expect(agent.state.messages).not.toBe(messages);
 		expect(agent.state.pendingToolCalls).not.toBe(pendingToolCalls);
 	});
+
+	it("continue() strips trailing errored or empty assistant placeholders when a prior message exists", async () => {
+		const mock = createMockModel({ responses: [{ content: ["recovered reply"], stopReason: "stop" }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([
+			{ role: "user", content: "initial request", timestamp: 1 },
+			{
+				...createAssistantMessage([{ type: "text", text: "" }]),
+				stopReason: "stop",
+				timestamp: 2,
+			},
+			{
+				...createAssistantMessage([]),
+				stopReason: "error",
+				errorMessage: "Couldn't reach cx2cc.bobmcmxciv.xin (getaddrinfo ENOTFOUND)",
+				timestamp: 3,
+			},
+		]);
+
+		await agent.continue();
+
+		expect(agent.state.messages.map(m => m.role)).toEqual(["user", "assistant"]);
+		expect(agent.state.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "text", text: "recovered reply" }],
+		});
+	});
 });

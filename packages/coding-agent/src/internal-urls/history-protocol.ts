@@ -415,9 +415,42 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			// Serve its transcript straight from disk if the session file persists.
 			const disk = await this.#resolveFromDisk(agentId, preferredArtifactDir, onlyPreferred);
 			if (disk) return { ...disk, url: url.href };
+			if (!onlyPreferred) {
+				const registry = AgentRegistry.global();
+				const pending = registry.getPending(agentId);
+				if (pending) {
+					const content = [
+						`# ${pending.id} (queued)`,
+						"",
+						"No transcript has been written yet — agent is queued waiting for a concurrency slot.",
+						`Queued ${formatAgo(pending.createdAt)}.`,
+						"",
+					].join("\n");
+					return {
+						url: url.href,
+						content,
+						contentType: "text/markdown",
+						size: Buffer.byteLength(content, "utf-8"),
+						notes: ["Source: agent registry (queued waiting for concurrency slot)"],
+					};
+				}
+				const terminal = registry.getTerminal(agentId);
+				if (terminal) {
+					throw new Error(
+						`Agent "${agentId}" has already ${terminal.outcome}${terminal.error ? ` (${terminal.error})` : ""} and left no transcript on disk.`,
+					);
+				}
+			}
 
-			const known = visible.map(candidate => candidate.id);
-			const knownStr = known.length > 0 ? known.join(", ") : "none";
+			const known = [
+				...visible.map(candidate => candidate.id),
+				...(onlyPreferred
+					? []
+					: AgentRegistry.global()
+							.listPending()
+							.map(candidate => candidate.id)),
+			];
+			const knownStr = known.length > 0 ? Array.from(new Set(known)).join(", ") : "none";
 			throw new Error(`Unknown agent: ${agentId}\nKnown agents: ${knownStr}\nList all with history://`);
 		}
 

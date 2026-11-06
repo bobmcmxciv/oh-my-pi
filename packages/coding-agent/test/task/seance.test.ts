@@ -30,6 +30,16 @@ function modelChange(id: string, parentId: string | null, model: string, role: s
 	};
 }
 
+function userMessage(id: string, parentId: string | null = null) {
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp: "2026-10-01T00:00:01.000Z",
+		message: { role: "user", content: "consult me", timestamp: 1 },
+	};
+}
+
 function modelUsage(id: string, parentId: string, activeLeafId: string | null) {
 	return {
 		type: "model_usage",
@@ -89,6 +99,7 @@ describe("seance source resolution", () => {
 		await writeSession(file, "saved-source-id", cwd, [
 			modelChange("default-model", null, "anthropic/claude-sonnet-4-5", "default"),
 			modelChange("active-model", "default-model", "anthropic/claude-sonnet-4-6", "fast"),
+			userMessage("source-user", "active-model"),
 		]);
 		const original = await fs.readFile(file);
 		const options = { cwd, sessionDirHint: sessionDir };
@@ -96,11 +107,13 @@ describe("seance source resolution", () => {
 		await expect(resolveSeanceSource(file, options)).resolves.toEqual({
 			file,
 			id: "saved-source-id",
+			cwd,
 			modelSelectors: ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"],
 		});
 		await expect(resolveSeanceSource("saved-source-id", options)).resolves.toEqual({
 			file,
 			id: "saved-source-id",
+			cwd,
 			modelSelectors: ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"],
 		});
 		expect(await fs.readFile(file)).toEqual(original);
@@ -115,6 +128,8 @@ describe("seance source resolution", () => {
 			modelChange("default-model", null, "anthropic/claude-sonnet-4-5", "default"),
 			modelChange("probe-owner", "default-model", "openai/gpt-4o", "fast"),
 			modelChange("active-model", "default-model", "anthropic/claude-sonnet-4-6", "fast"),
+			userMessage("source-user", "active-model"),
+			// Last: a usage record that still points at the active leaf.
 			modelUsage("late-usage", "probe-owner", "active-model"),
 		];
 		await writeSession(file, "active-model-source", cwd, entries);
@@ -126,6 +141,8 @@ describe("seance source resolution", () => {
 		const clearedFile = path.join(sessionDir, "cleared-usage.jsonl");
 		await writeSession(clearedFile, "cleared-model-source", cwd, [
 			...entries.slice(0, 3),
+			userMessage("cleared-user", "active-model"),
+			// Last: a usage record that cleared the active leaf → no saved model.
 			modelUsage("cleared-usage", "probe-owner", null),
 		]);
 		await expect(resolveSeanceSource(clearedFile, { cwd, sessionDirHint: sessionDir })).resolves.toMatchObject({
@@ -163,7 +180,7 @@ describe("seance source resolution", () => {
 		const sourceFile = path.join(sessionDir, "source.jsonl");
 		const orphanFile = path.join(sessionDir, "orphan.jsonl");
 		const backupFile = `${orphanFile}.1700000000000.bak`;
-		await writeSession(sourceFile, "source-id", cwd);
+		await writeSession(sourceFile, "source-id", cwd, [userMessage("source-user")]);
 		await writeSession(backupFile, "orphan-id", cwd);
 		const originalBackup = await fs.readFile(backupFile);
 
@@ -179,8 +196,8 @@ describe("seance source resolution", () => {
 		using tempDir = TempDir.createSync("@omp-seance-nested-ambiguity-");
 		const cwd = path.join(tempDir.path(), "project");
 		const artifactsDir = path.join(tempDir.path(), "artifacts");
-		await writeSession(path.join(artifactsDir, "history-one", "worker.jsonl"), "worker-id", cwd);
-		await writeSession(path.join(artifactsDir, "history-two", "worker.jsonl"), "worker-id", cwd);
+		await writeSession(path.join(artifactsDir, "history-one", "worker.jsonl"), "worker-id", cwd, [userMessage("u1")]);
+		await writeSession(path.join(artifactsDir, "history-two", "worker.jsonl"), "worker-id", cwd, [userMessage("u2")]);
 
 		await expect(resolveSeanceSource("worker", { cwd, artifactsDirHint: artifactsDir })).rejects.toThrow(
 			'Session selector "worker" is ambiguous.',
@@ -192,8 +209,10 @@ describe("seance source resolution", () => {
 		const cwd = path.join(tempDir.path(), "project");
 		const artifactsDir = path.join(tempDir.path(), "artifacts");
 		const directFile = path.join(artifactsDir, "worker.jsonl");
-		await writeSession(directFile, "worker-id", cwd);
-		await writeSession(path.join(artifactsDir, "history", "worker.jsonl"), "worker-id", cwd);
+		await writeSession(directFile, "worker-id", cwd, [userMessage("direct-user")]);
+		await writeSession(path.join(artifactsDir, "history", "worker.jsonl"), "worker-id", cwd, [
+			userMessage("hist-user"),
+		]);
 
 		await expect(resolveSeanceSource("worker", { cwd, artifactsDirHint: artifactsDir })).resolves.toMatchObject({
 			file: directFile,
@@ -207,7 +226,7 @@ describe("seance source resolution", () => {
 			const cwd = path.join(tempDir.path(), "project");
 			const otherCwd = path.join(tempDir.path(), "other-project");
 			const foreignFile = path.join(sessionDirForCwd(otherCwd), "foreign.jsonl");
-			await writeSession(foreignFile, "foreign-project-id", otherCwd);
+			await writeSession(foreignFile, "foreign-project-id", otherCwd, [userMessage("foreign-user")]);
 
 			await expect(resolveSeanceSource("foreign-project-id", { cwd })).rejects.toThrow(
 				'Session "foreign-project-id" was not found.',
@@ -224,7 +243,7 @@ describe("seance source resolution", () => {
 		const home = path.join(tempDir.path(), "home");
 		vi.spyOn(os, "homedir").mockReturnValue(home);
 		const file = path.join(home, "saved", "home-source.jsonl");
-		await writeSession(file, "home-source-id", home);
+		await writeSession(file, "home-source-id", home, [userMessage("home-user")]);
 
 		const resolved = await resolveSeanceSource("~/saved/home-source.jsonl", {
 			cwd: path.join(tempDir.path(), "project"),
@@ -250,7 +269,7 @@ describe("seance source resolution", () => {
 			const originalBackup = await fs.readFile(backupFile);
 
 			const sourceFile = path.join(defaultSessionDir, "source.jsonl");
-			await writeSession(sourceFile, "source-id", cwd);
+			await writeSession(sourceFile, "source-id", cwd, [userMessage("source-user")]);
 			await expect(resolveSeanceSource("source-id", { cwd })).resolves.toMatchObject({
 				file: sourceFile,
 				id: "source-id",
@@ -267,6 +286,79 @@ describe("seance source resolution", () => {
 			expect((await fs.stat(legacyDir)).isDirectory()).toBe(true);
 			await expect(fs.stat(migratedLegacyDir)).rejects.toThrow();
 		});
+	});
+
+	it("resolves an id the archive view can list but the local project cannot", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-archive-id-");
+		await withAgentDir(path.join(tempDir.path(), "agent"), async () => {
+			const cwd = path.join(tempDir.path(), "project");
+			const otherCwd = path.join(tempDir.path(), "other-project");
+			const foreignFile = path.join(sessionDirForCwd(otherCwd), "20261105-120000_archive-listed-id.jsonl");
+			await writeSession(foreignFile, "archive-listed-id", otherCwd, [userMessage("foreign-user")]);
+
+			// `prepareSeance` always passes includeGlobal so task-path consults see what
+			// `archive.sessions("*")` lists; the bare call keeps project scope.
+			await expect(resolveSeanceSource("archive-listed-id", { cwd })).rejects.toThrow(
+				'Session "archive-listed-id" was not found.',
+			);
+			await expect(resolveSeanceSource("archive-listed-id", { cwd, includeGlobal: true })).resolves.toMatchObject({
+				file: foreignFile,
+				id: "archive-listed-id",
+				cwd: otherCwd,
+			});
+			// Any unique prefix resolves, like `archive.session(<prefix>)`.
+			await expect(resolveSeanceSource("archive-list", { cwd, includeGlobal: true })).resolves.toMatchObject({
+				file: foreignFile,
+				id: "archive-listed-id",
+			});
+		});
+	});
+
+	it("resolves sessions in a -tmp bucket by global filename id", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-tmp-bucket-");
+		await withAgentDir(path.join(tempDir.path(), "agent"), async () => {
+			const cwd = path.join(tempDir.path(), "project");
+			const tmpCwd = path.join(os.tmpdir(), `omp-seance-tmp-${Date.now()}`);
+			const tmpFile = path.join(sessionDirForCwd(tmpCwd), "20261105-120001_tmp-bucket-id.jsonl");
+			expect(path.basename(path.dirname(tmpFile)).startsWith("-tmp")).toBe(true);
+			await writeSession(tmpFile, "tmp-bucket-id", tmpCwd, [userMessage("tmp-user")]);
+
+			await expect(resolveSeanceSource("tmp-bucket-id", { cwd, includeGlobal: true })).resolves.toMatchObject({
+				file: tmpFile,
+				id: "tmp-bucket-id",
+				cwd: tmpCwd,
+			});
+		});
+	});
+
+	it("rejects duplicate ids that collide across project buckets", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-global-ambiguity-");
+		await withAgentDir(path.join(tempDir.path(), "agent"), async () => {
+			const cwd = path.join(tempDir.path(), "project");
+			for (const project of ["other-a", "other-b"]) {
+				const file = path.join(
+					sessionDirForCwd(path.join(tempDir.path(), project)),
+					`20261105-120000_dup-id-${project}.jsonl`,
+				);
+				await writeSession(file, "dup-id", path.join(tempDir.path(), project), [userMessage("dup-user")]);
+			}
+
+			await expect(resolveSeanceSource("dup-id", { cwd, includeGlobal: true })).rejects.toThrow(
+				'Session selector "dup-id" is ambiguous.',
+			);
+		});
+	});
+
+	it("refuses a session that contains no conversation", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-empty-source-");
+		const cwd = path.join(tempDir.path(), "project");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const file = path.join(sessionDir, "stub.jsonl");
+		await writeSession(file, "stub-id", cwd);
+
+		await expect(resolveSeanceSource("stub-id", { cwd, sessionDirHint: sessionDir })).rejects.toThrow(
+			"The selected session contains no conversation to consult.",
+		);
 	});
 });
 

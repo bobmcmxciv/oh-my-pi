@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `terminateProcessTree()` on Windows leaving live descendants behind when the root process had already exited, and refused unverified raw-PID tree kills without a pinned process handle
+
 ## [18.12.6] - 2026-10-21
 
 ### Added

@@ -32,7 +32,7 @@ More globals; `read` the linked docs before first use:
 {{/if}}
 
 <critical>
-NEVER repeat successful setup. Kernel-loss notice means reload setup.
+NEVER repeat successful setup. Kernel-loss notice means reload setup. NEVER run long compiles or multi-service builds (`mvn`, `cargo`, `npm run build`) synchronously inside `eval` (timeout kills the kernel); use `bash`.
 </critical>
 
 {{#if autoBackgroundEnabled}}Long cells may auto-background and deliver later; the kernel stays busy. `timeout: 0` disables the cell deadline, not the foreground wait.{{/if}}

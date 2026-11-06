@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- `Agent.continue()` and `agentLoopContinue()` now strip trailing empty, errored, or aborted assistant placeholder frames when earlier conversation messages exist to continue from
 - Fixed split-turn compaction leaving `session.compacting` context out of the turn-prefix summary ([#16707](https://github.com/can1357/oh-my-pi/pull/16707) by [@integrITsolutions](https://github.com/integrITsolutions))
 - Fixed compaction failing as a whole, and discarding the completed summary, when the optional short summary fails or returns no answer; the compaction now completes without a short summary, and cancellation still cancels it ([#33](https://github.com/mouriya-s-lab/oh-my-pi/issues/33))
 

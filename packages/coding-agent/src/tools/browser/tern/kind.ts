@@ -21,6 +21,7 @@ export interface TernKind extends TernPane {
 
 /** The Tern pane omp runs in, or null outside Tern (`TERN_PANE_SOCKET` unset or `TERN_PANE` not a block id). */
 export function resolveTernPane(env: Record<string, string | undefined> = process.env): TernPane | null {
+	if (env.SSH_CONNECTION || env.SSH_TTY || env.SSH_CLIENT) return null;
 	const socketPath = env.TERN_PANE_SOCKET?.trim();
 	const pane = env.TERN_PANE?.trim();
 	if (!socketPath || !pane || !/^\d+$/.test(pane)) return null;

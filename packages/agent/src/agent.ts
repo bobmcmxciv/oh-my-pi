@@ -36,6 +36,7 @@ import {
 	normalizeTools,
 	resolveOwnedDialectFromEnv,
 	steeringQueueState,
+	stripRecoverableAssistantTail,
 	unpairedToolCallTail,
 } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
@@ -1727,6 +1728,14 @@ export class Agent {
 				if (queuedFollowUp.length > 0) {
 					await this.#runLoop(queuedFollowUp, undefined, signal, true);
 					return;
+				}
+				if (!dequeueSignal.aborted) {
+					const stripped = stripRecoverableAssistantTail(this.#state.messages);
+					if (stripped && (stripped[stripped.length - 1].role !== "assistant" || unpairedToolCallTail(stripped))) {
+						this.replaceMessages(stripped);
+						await this.#runLoop(undefined, undefined, signal, true);
+						return;
+					}
 				}
 
 				throw new Error("Cannot continue from message role: assistant");

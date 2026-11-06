@@ -28,6 +28,11 @@ describe("resolveTernKind", () => {
 		expect(resolveTernKind({ settingEnabled: false }, TERN_ENV)).toBeNull();
 		expect(resolveTernKind({ settingEnabled: false }, { ...TERN_ENV, PI_BROWSER_TERN: "1" })).toEqual(TERN);
 	});
+
+	it("rejects forwarded Tern socket variables inside an SSH session", () => {
+		expect(resolveTernKind(null, { ...TERN_ENV, SSH_CONNECTION: "10.0.0.1 1 10.0.0.2 22" })).toBeNull();
+		expect(resolveTernKind(null, { ...TERN_ENV, SSH_TTY: "/dev/pts/0" })).toBeNull();
+	});
 });
 
 describe("resolveBrowserKind with Tern", () => {

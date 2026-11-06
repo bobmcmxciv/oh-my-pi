@@ -370,11 +370,21 @@ export class SessionProviderBoundary {
 		}
 		const obfuscateText = (archive: Record<string, unknown>): Record<string, unknown> => {
 			let obfuscated = archive;
-			for (const key of ["text", "textHead", "textTail"] as const) {
+			for (const key of ["text", "textHead", "textTail", "todoState"] as const) {
 				const value = archive[key];
 				if (typeof value !== "string" || value.length === 0) continue;
 				const next = obfuscator.obfuscate(value);
 				if (next !== value) obfuscated = { ...obfuscated, [key]: next };
+			}
+			if (Array.isArray(archive.userPrompts)) {
+				let promptsChanged = false;
+				const nextPrompts = archive.userPrompts.map(item => {
+					if (typeof item !== "string" || item.length === 0) return item;
+					const next = obfuscator.obfuscate(item);
+					if (next !== item) promptsChanged = true;
+					return next;
+				});
+				if (promptsChanged) obfuscated = { ...obfuscated, userPrompts: nextPrompts };
 			}
 			return obfuscated;
 		};

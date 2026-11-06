@@ -643,6 +643,10 @@ export interface Archive {
 	textHead?: string;
 	/** Newest text region kept verbatim around the imaged middle. */
 	textTail?: string;
+	/** Active Todo ledger snapshot carried as plain text across compactions. */
+	todoState?: string;
+	/** Chronological user prompt directives carried as plain text across compactions. */
+	userPrompts?: string[];
 	/** The same history re-rendered for a reader that excludes assistant
 	 *  reasoning ({@link SerializeOptions.includeThinking} `false`), when this
 	 *  archive carries it. Read through {@link viewWithoutThinking}. */
@@ -675,6 +679,10 @@ export interface Options<TMessage = Message> extends SerializeOptions {
 	frameSize?: number;
 	/** Upper limit on archive frames; clamped to (and defaulting to) {@link MAX_FRAMES_DEFAULT}. */
 	maxFrames?: number;
+	/** Explicit active Todo ledger text to preserve in the summary (`""` clears prior state). */
+	todoState?: string;
+	/** Explicit user prompt directives to merge and preserve in the summary. */
+	userPrompts?: readonly string[];
 }
 
 /** Result of rendering one frame. */
@@ -700,6 +708,8 @@ export interface FileOperations {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	todoState?: string;
+	userPrompts?: string[];
 }
 
 export interface CompactionPreparation<TMessage = Message> {
@@ -1139,6 +1149,99 @@ export function serializeConversation(messages: Message[], options?: SerializeOp
 	}
 
 	return parts.join("\n\n");
+}
+
+const USER_DIRECTIVE_MAX_CHARS = 600;
+const MAX_USER_DIRECTIVES = 12;
+const MAX_TOTAL_USER_DIRECTIVES_CHARS = 2400;
+const SYSTEM_REMINDER_BLOCK_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/gi;
+const HAPI_USER_CONTEXT_BLOCK_RE = /<hapi_user_context\b[^>]*>[\s\S]*?<\/hapi_user_context>/gi;
+
+/** Clean one raw user message into a compact, self-contained directive string. */
+export function cleanUserDirectiveText(raw: string): string {
+	const stripped = stripDimMarkers(raw)
+		.replace(SYSTEM_REMINDER_BLOCK_RE, "")
+		.replace(HAPI_USER_CONTEXT_BLOCK_RE, "")
+		.trim();
+	if (!stripped || stripped.startsWith("Resume prior conversation.")) return "";
+	const healed = elideDataUrls(stripped)
+		.replace(/\r\n/g, "\n")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+	if (!healed) return "";
+	return truncateForSummary(healed, USER_DIRECTIVE_MAX_CHARS, TRUNCATE_HEAD_RATIO);
+}
+
+function extractUserPromptsFromMessages(messages: readonly Message[]): string[] {
+	const prompts: string[] = [];
+	for (const msg of messages) {
+		if (msg.role !== "user") continue;
+		if (msg.attribution === "agent") continue;
+		const raw =
+			typeof msg.content === "string"
+				? msg.content
+				: msg.content
+						.filter((part): part is { type: "text"; text: string } => part.type === "text")
+						.map(part => part.text)
+						.join("");
+		const cleaned = cleanUserDirectiveText(raw);
+		if (cleaned) prompts.push(cleaned);
+	}
+	return prompts;
+}
+
+function mergeAndBoundUserPrompts(prior: readonly string[] | undefined, current: readonly string[]): string[] {
+	const merged: string[] = [];
+	for (const item of [...(prior ?? []), ...current]) {
+		const normalized = item.trim();
+		if (!normalized) continue;
+		if (merged[merged.length - 1] === normalized) continue;
+		const existingIdx = merged.indexOf(normalized);
+		if (existingIdx !== -1) {
+			// Keep chronological position of initial directive; move repeated follow-ups to latest position.
+			if (existingIdx === 0) continue;
+			merged.splice(existingIdx, 1);
+		}
+		merged.push(normalized);
+	}
+	if (merged.length === 0) return [];
+	if (merged.length === 1) return merged;
+
+	const first = merged[0]!;
+	const tail: string[] = [];
+	let totalChars = first.length;
+	for (let i = merged.length - 1; i >= 1; i--) {
+		if (tail.length + 1 >= MAX_USER_DIRECTIVES) break;
+		const candidate = merged[i]!;
+		if (totalChars + candidate.length > MAX_TOTAL_USER_DIRECTIVES_CHARS && tail.length > 0) break;
+		tail.unshift(candidate);
+		totalChars += candidate.length;
+	}
+	return [first, ...tail];
+}
+
+function formatUserDirectives(prompts: readonly string[] | undefined): string | undefined {
+	if (!prompts || prompts.length === 0) return undefined;
+	return prompts.map((directive, idx) => `- [${idx + 1}] ${directive.replace(/\s*\n\s*/g, " ⏎ ")}`).join("\n");
+}
+
+function extractTodoStateFromMessages(messages: readonly Message[]): { found: boolean; state: string | undefined } {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i]!;
+		if (msg.role !== "toolResult") continue;
+		if (msg.toolName !== "todo") continue;
+		if (msg.isError === true) continue;
+		const raw = msg.content
+			.filter((part): part is { type: "text"; text: string } => part.type === "text")
+			.map(part => part.text)
+			.join("");
+		const cleaned = elideDataUrls(stripDimMarkers(raw)).trim();
+		if (!cleaned || cleaned === "Todo list is empty." || cleaned === "Todo list cleared.") {
+			return { found: true, state: undefined };
+		}
+		return { found: true, state: cleaned };
+	}
+	return { found: false, state: undefined };
 }
 
 // ============================================================================
@@ -1797,6 +1900,11 @@ function validateArchive(candidate: unknown): Archive | undefined {
 	const text = typeof archive.text === "string" && archive.text.length > 0 ? archive.text : undefined;
 	const textHead = typeof archive.textHead === "string" && archive.textHead.length > 0 ? archive.textHead : undefined;
 	const textTail = typeof archive.textTail === "string" && archive.textTail.length > 0 ? archive.textTail : undefined;
+	const todoState =
+		typeof archive.todoState === "string" && archive.todoState.trim().length > 0 ? archive.todoState : undefined;
+	const userPrompts = Array.isArray(archive.userPrompts)
+		? archive.userPrompts.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+		: undefined;
 	// A text-only archive (everything fit in the plain-text regions) is valid;
 	// only an archive carrying neither frames nor text is empty.
 	if (frames.length === 0 && text === undefined && textHead === undefined && textTail === undefined) return undefined;
@@ -1807,6 +1915,8 @@ function validateArchive(candidate: unknown): Archive | undefined {
 		...(text !== undefined ? { text } : {}),
 		...(textHead !== undefined ? { textHead } : {}),
 		...(textTail !== undefined ? { textTail } : {}),
+		...(todoState !== undefined ? { todoState } : {}),
+		...(userPrompts && userPrompts.length > 0 ? { userPrompts } : {}),
 	};
 }
 
@@ -2310,14 +2420,19 @@ export function viewWithoutThinking(summary: string, archive: Archive, details?:
 	const textTail = fits || tailChars === 0 ? "" : text.slice(text.length - tailChars);
 	const truncatedChars = archive.truncatedChars + (fits ? 0 : text.length - headChars - tailChars);
 	const files = details ? formatFileList(details.readFiles, details.modifiedFiles) : "";
+	const todoState = archive.todoState ? textWithoutThinking(archive.todoState) : undefined;
+	const userPrompts = archive.userPrompts?.map(textWithoutThinking).filter(Boolean);
+	const userDirectives = formatUserDirectives(userPrompts);
 	return {
 		summary:
-			textHead.length === 0 && files.length === 0
+			textHead.length === 0 && files.length === 0 && !todoState && !userDirectives
 				? "No prior history."
 				: prompt.render(snapcompactSummaryPrompt, {
 						frameCount: 0,
 						truncatedChars,
 						includedPreviousSummary: text.startsWith(PREVIOUS_SUMMARY_HEAD),
+						todoState,
+						userDirectives,
 						files: files.length > 0 ? files : undefined,
 						includeThinking: false,
 					}),
@@ -2328,6 +2443,8 @@ export function viewWithoutThinking(summary: string, archive: Archive, details?:
 			...(text ? { text } : {}),
 			...(textHead ? { textHead } : {}),
 			...(textTail ? { textTail } : {}),
+			...(todoState ? { todoState } : {}),
+			...(userPrompts && userPrompts.length > 0 ? { userPrompts } : {}),
 		},
 	};
 }
@@ -2439,9 +2556,31 @@ export async function compact<TMessage = Message>(
 
 	const textHead = layout.textHead;
 	const textTail = layout.textTail.length > 0 ? (dimOpen ? DIM_ON : "") + layout.textTail : "";
-	const textChars = textHead.length + textTail.length;
 
 	const frames = await Promise.all(newFrames);
+
+	const resolvedTodoState =
+		options?.todoState !== undefined
+			? options.todoState.trim() || undefined
+			: (() => {
+					const fromMessages = extractTodoStateFromMessages(llmMessages);
+					return fromMessages.found ? fromMessages.state : previousArchive?.todoState;
+				})();
+	const extractedUserPrompts =
+		options?.userPrompts !== undefined
+			? options.userPrompts.map(cleanUserDirectiveText).filter(Boolean)
+			: extractUserPromptsFromMessages(llmMessages);
+	const mergedUserPrompts = mergeAndBoundUserPrompts(previousArchive?.userPrompts, extractedUserPrompts);
+	const shouldIncludeUserDirectives =
+		mergedUserPrompts.length > 0 &&
+		(frames.length > 0 ||
+			truncatedChars > 0 ||
+			mergedUserPrompts.length > 1 ||
+			options?.userPrompts !== undefined ||
+			resolvedTodoState !== undefined);
+	const userDirectives = shouldIncludeUserDirectives ? formatUserDirectives(mergedUserPrompts) : undefined;
+	const structuredTextChars = (resolvedTodoState?.length ?? 0) + (userDirectives?.length ?? 0);
+	const textChars = textHead.length + textTail.length + structuredTextChars;
 	const totalChars = frames.reduce((sum, frame) => sum + frame.chars, 0) + textChars;
 	const frameCols: number[] = [];
 	for (const frame of frames) {
@@ -2453,7 +2592,14 @@ export async function compact<TMessage = Message>(
 	const files = formatFileList(readFiles, modifiedFiles, fileOps.read);
 
 	let summary: string;
-	if (frames.length === 0 && textHead.length === 0 && textTail.length === 0 && files.length === 0) {
+	if (
+		frames.length === 0 &&
+		textHead.length === 0 &&
+		textTail.length === 0 &&
+		files.length === 0 &&
+		!resolvedTodoState &&
+		!userDirectives
+	) {
 		summary = "No prior history.";
 	} else {
 		summary = prompt.render(snapcompactSummaryPrompt, {
@@ -2467,6 +2613,8 @@ export async function compact<TMessage = Message>(
 			lineRepeated: high.lineRepeat > 1,
 			truncatedChars,
 			includedPreviousSummary,
+			todoState: resolvedTodoState,
+			userDirectives,
 			files: files.length > 0 ? files : undefined,
 			includeThinking: options?.includeThinking !== false,
 		});
@@ -2487,6 +2635,8 @@ export async function compact<TMessage = Message>(
 		...(persistedText.length > 0 ? { text: persistedText } : {}),
 		...(textHead ? { textHead } : {}),
 		...(textTail ? { textTail } : {}),
+		...(resolvedTodoState ? { todoState: resolvedTodoState } : {}),
+		...(shouldIncludeUserDirectives ? { userPrompts: mergedUserPrompts } : {}),
 	};
 
 	const textNote = textChars > 0 ? ` (+${textChars.toLocaleString()} chars as text)` : "";
@@ -2495,7 +2645,12 @@ export async function compact<TMessage = Message>(
 		shortSummary: `Archived ${totalChars.toLocaleString()} chars of history onto ${frames.length} snapcompact frame${frames.length === 1 ? "" : "s"}${textNote}`,
 		firstKeptEntryId,
 		tokensBefore,
-		details: { readFiles, modifiedFiles },
+		details: {
+			readFiles,
+			modifiedFiles,
+			...(resolvedTodoState ? { todoState: resolvedTodoState } : {}),
+			...(shouldIncludeUserDirectives ? { userPrompts: mergedUserPrompts } : {}),
+		},
 		preserveData: { ...basePreserve, [PRESERVE_KEY]: archive },
 	};
 }

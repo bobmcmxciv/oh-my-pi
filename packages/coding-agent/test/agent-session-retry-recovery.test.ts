@@ -783,4 +783,136 @@ describe("AgentSession retry recovery", () => {
 			content: [{ type: "text", text: "recovered after credential switch" }],
 		});
 	});
+
+	it("continues cleanly when stacked empty or errored assistant frames remain at the tail before retry", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		let attempt = 0;
+		const mock = createMockModel({
+			responses: [
+				{ stopReason: "error", errorMessage: "Couldn't reach cx2cc.bobmcmxciv.xin (getaddrinfo ENOTFOUND)" },
+				{ content: ["Recovered after stripping assistant tail."], stopReason: "stop" },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: requestedModel => modelRegistry.resolver(requestedModel, agent.sessionId),
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				attempt++;
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+		const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
+		managers.push(sessionManager);
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"retry.enabled": true,
+				"retry.baseDelayMs": 5,
+				"retry.maxDelayMs": 100,
+				"retry.maxRetries": 2,
+				"retry.modelFallback": false,
+				"features.unexpectedStopDetection": "none",
+			}),
+			modelRegistry,
+		});
+		sessions.push(session);
+
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") {
+				// Simulate a rebuilt/stale context leaving both an empty assistant placeholder
+				// and a recreated errored assistant frame at the tail during retry backoff.
+				session.agent.replaceMessages([
+					...session.agent.state.messages,
+					assistantMessage({
+						content: [{ type: "text", text: "" }],
+						stopReason: "stop",
+						timestamp: Date.now() - 2,
+					}),
+					assistantMessage({
+						content: [],
+						stopReason: "error",
+						errorMessage: "Couldn't reach cx2cc.bobmcmxciv.xin (getaddrinfo ENOTFOUND)",
+						timestamp: Date.now() - 1,
+					}),
+				]);
+			}
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		mockSchedulerWaitWithClock();
+		await session.prompt("Test retry with assistant tail");
+		await session.waitForIdle();
+
+		expect(attempt).toBe(2);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]?.success).toBe(true);
+		expect(retryEndEvents[0]?.finalError).toBeUndefined();
+		successfulAssistantEntry(sessionManager, "Recovered after stripping assistant tail.");
+	});
+
+	it("holds yieldQueue idle flushes during active retry backoff so async deliveries do not trigger local assistant-tail failure", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const mock = createMockModel({
+			responses: [
+				{ stopReason: "error", errorMessage: "Couldn't reach cx2cc.bobmcmxciv.xin (getaddrinfo ENOTFOUND)" },
+				{ content: ["Processed async delivery after retry."], stopReason: "stop" },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: requestedModel => modelRegistry.resolver(requestedModel, agent.sessionId),
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
+		managers.push(sessionManager);
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"retry.enabled": true,
+				"retry.baseDelayMs": 20,
+				"retry.maxDelayMs": 100,
+				"retry.maxRetries": 2,
+				"retry.modelFallback": false,
+				"features.unexpectedStopDetection": "none",
+			}),
+			modelRegistry,
+		});
+		sessions.push(session);
+		session.yieldQueue.register<string>("test-async", {
+			build: items => ({
+				role: "custom",
+				customType: "async-result",
+				content: items.join("\n"),
+				display: true,
+				attribution: "agent",
+				timestamp: Date.now(),
+			}),
+		});
+
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") {
+				session.yieldQueue.enqueue("test-async", "Background job Supplement completed.");
+			}
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Start turn that fails then receives async job during retry");
+		await session.waitForIdle();
+
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]?.success).toBe(true);
+		expect(retryEndEvents.some(e => e.finalError?.includes("Cannot continue from message role: assistant"))).toBe(
+			false,
+		);
+	});
 });

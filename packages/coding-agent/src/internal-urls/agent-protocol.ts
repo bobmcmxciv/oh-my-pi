@@ -222,12 +222,38 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			// registry `write agent://<id>` delivers to: answer with its progress.
 			const ref = registry.get(outputId);
 			if (ref && ref.kind !== "advisor") return this.#resolveProgress(url, ref, extraction);
+			const pending = registry.getPending(outputId);
+			if (pending) {
+				if (extraction) {
+					throw new Error(
+						`Output ${outputId} is not published yet (status: pending, waiting for concurrency slot); read agent://${outputId} for its progress.`,
+					);
+				}
+				const content = `# ${pending.id} (pending — waiting for concurrency slot)\n\nAgent "${pending.id}" (${pending.displayName}) is queued waiting for a concurrency slot and has not started yet.\n`;
+				return {
+					url: url.href,
+					content,
+					contentType: "text/markdown",
+					size: Buffer.byteLength(content, "utf-8"),
+					notes: ["No published output; agent is queued waiting for a concurrency slot (pending)"],
+					shape: "document",
+				};
+			}
+			const terminal = registry.getTerminal(outputId);
+			if (terminal) {
+				throw new Error(
+					`Agent "${outputId}" has already ${terminal.outcome}${terminal.error ? ` (${terminal.error})` : ""} without publishing output. Check history://${outputId} if a transcript was recorded.`,
+				);
+			}
 			if (!scan) throw new Error("No session - agent outputs unavailable");
 			if (!scan.anyDirExists) throw new Error("No artifacts directory found");
-			const registered = registry
-				.list()
-				.filter(candidate => candidate.kind !== "advisor")
-				.map(candidate => candidate.id);
+			const registered = [
+				...registry
+					.list()
+					.filter(candidate => candidate.kind !== "advisor")
+					.map(candidate => candidate.id),
+				...registry.listPending().map(candidate => candidate.id),
+			];
 			throw notFoundError(outputId, [...scan.availableIds, ...registered]);
 		}
 

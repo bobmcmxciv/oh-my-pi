@@ -2009,6 +2009,16 @@ export class AgentSession implements SettingsScope {
 				this.#maintenance.runAutoCompaction(reason, willRetry, options),
 			shakeForRequestBodyReadTimeout: generation => this.#maintenance.shakeForRequestBodyReadTimeout(generation),
 			withBashBranchTransition: operation => this.#bash.withBranchTransition(operation),
+			onRetryResolved: () => {
+				if (
+					!this.isStreaming &&
+					!this.isSessionTransitioning &&
+					!this.#recovery.attempt &&
+					!this.#recovery.retryPromise
+				) {
+					this.yieldQueue.requestIdleFlush();
+				}
+			},
 		};
 		this.#fallbackChainValidationDeferred = config.deferRetryFallbackValidation === true;
 		this.#recovery = new TurnRecovery(recoveryHost, {
@@ -2133,7 +2143,11 @@ export class AgentSession implements SettingsScope {
 		this.yieldQueue = new YieldQueue({
 			// A transition swaps the transcript under the agent: hold idle deliveries until it
 			// settles, so a result from the outgoing session cannot start a turn in the target.
-			isStreaming: () => this.isStreaming || this.isSessionTransitioning,
+			isStreaming: () =>
+				this.isStreaming ||
+				this.isSessionTransitioning ||
+				this.#recovery.attempt > 0 ||
+				this.#recovery.retryPromise !== undefined,
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
@@ -5030,6 +5044,9 @@ export class AgentSession implements SettingsScope {
 			}
 			for (;;) {
 				try {
+					if (isAutomaticRetry || coalescedSources.has("automatic-retry")) {
+						this.#recovery.stripFailedAssistantTailForRetryContinue();
+					}
 					await this.agent.continue(signal);
 					return { status: "completed" };
 				} catch (error) {
@@ -11994,8 +12011,8 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Delivers an IRC message into this recipient session. */
-	deliverIrcMessage(msg: IrcMessage): Promise<"injected" | "woken"> {
-		return this.#irc.deliver(msg);
+	deliverIrcMessage(msg: IrcMessage, opts?: { preStart?: boolean }): Promise<"injected" | "woken"> {
+		return this.#irc.deliver(msg, opts);
 	}
 
 	/** Recognizes parent IRC steering at message consumption, without promoting queued requests. */

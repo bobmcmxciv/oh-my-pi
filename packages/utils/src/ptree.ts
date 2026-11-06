@@ -702,6 +702,135 @@ export async function exec(cmd: string[], opts?: ExecOptions): Promise<ExecResul
 	return await child.wait({ stderr, allowAbort, allowNonZero });
 }
 
+// ── Standalone tree termination ──────────────────────────────────────────────
+
+/** Options for {@link terminateProcessTree}. */
+export interface ProcessTreeTerminateOptions extends Omit<ProcessTerminateOptions, "signal"> {
+	/** Cancels native termination waits; cleanup still attempts the pinned tree sweep. */
+	signal?: AbortSignal;
+}
+
+/** Open a stable process handle without throwing; the napi realm may reject foreign pids. */
+export function pinProcess(pid: number | undefined): Process | undefined {
+	if (pid === undefined) return undefined;
+	try {
+		return Process.fromPid(pid) ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function processRunning(process: Process | undefined): boolean {
+	if (!process) return false;
+	try {
+		return process.status() === "running";
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Pin every currently reachable descendant before signalling any member.
+ * Handles preserve identity when wrappers exit during the termination wave;
+ * descendants already orphaned through an unobserved dead intermediary cannot
+ * be recovered safely from parent PIDs alone.
+ */
+function pinDescendants(root: Process): Process[] {
+	const pinned: Process[] = [];
+	const seen = new Set<number>([root.pid]);
+	const queue: Process[] = [root];
+	for (let cursor = 0; cursor < queue.length; cursor++) {
+		const parent = queue[cursor];
+		let children: Process[];
+		try {
+			children = parent.children();
+		} catch {
+			continue;
+		}
+		for (const child of children) {
+			if (seen.has(child.pid)) continue;
+			seen.add(child.pid);
+			pinned.push(child);
+			queue.push(child);
+		}
+	}
+	return pinned;
+}
+
+/**
+ * Terminate a process and its reachable descendant tree, whichever layer
+ * spawned it (Bun subprocess, PTY session, or a pid recovered from metadata).
+ *
+ * Pass the `Process` handle pinned at spawn time whenever available: it pins
+ * the OS-level identity so a dead or pid-recycled root can still enumerate its
+ * original children — a fresh `Process.fromPid` at kill time opens whatever
+ * now owns the pid, or nothing.
+ *
+ * The killTree sweep runs unconditionally after `terminate`: when the root is
+ * already dead, `terminate` returns immediately and never signals descendants,
+ * and the sweep is the only step that reaches children orphaned under it. On
+ * Windows the signal argument is ignored (every wave is TerminateProcess); on
+ * Unix it is the hard signal, matching the escalation terminate already ran.
+ *
+ * Resolves `true` once the root is confirmed exited; descendants are always
+ * signalled but liveness of every leaf is best-effort (a wrapper that died
+ * before any handle pinned it can orphan children no parent-pid walk finds).
+ */
+export async function terminateProcessTree(
+	target: number | Process,
+	options?: ProcessTreeTerminateOptions,
+): Promise<boolean> {
+	const root = typeof target === "number" ? pinProcess(target) : target;
+	const pid = typeof target === "number" ? target : target.pid;
+	if (!root) {
+		// Without a stable Windows handle, a numeric PID may already belong to
+		// somebody else. Never taskkill or signal that unverified identity.
+		if (process.platform === "win32") return false;
+		const signal = (name: NodeJS.Signals) => {
+			try {
+				process.kill(options?.group === true ? -pid : pid, name);
+			} catch {
+				if (options?.group === true) {
+					try {
+						process.kill(pid, name);
+					} catch {}
+				}
+			}
+		};
+		signal("SIGKILL");
+		return !processRunning(pinProcess(pid));
+	}
+
+	// Pin live descendants before signalling: children born mid-termination —
+	// or orphaned when their parent dies inside the wave — stay reachable
+	// through the pinned handles even when the platform walk no longer sees them.
+	const pinned = pinDescendants(root);
+	let exited = false;
+	try {
+		exited = await root.terminate(options).catch(() => false);
+	} catch {
+		exited = false;
+	}
+	// Dead-root skip: terminate() reports success without ever signalling the
+	// tree when the root already exited, so this sweep is not optional.
+	try {
+		root.killTree(9);
+	} catch {}
+	// Re-check through the handles pinned before termination: a descendant that
+	// survived (or was spawned between the native waves) is signalled directly.
+	for (const member of pinned) {
+		if (!processRunning(member)) continue;
+		try {
+			member.killTree(9);
+		} catch {}
+	}
+	if (exited) return true;
+	// terminate() waited its full timeout; confirm root death directly rather
+	// than trusting the boolean when the sweep above did the real work.
+	if (options?.signal?.aborted) return false;
+	return !processRunning(root);
+}
+
 // ── Signal combinators ───────────────────────────────────────────────────────
 
 type SignalValue = AbortSignal | number | null | undefined;

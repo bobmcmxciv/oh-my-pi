@@ -25,6 +25,8 @@ export interface SSHHostInfo {
 	version: number;
 	os: SSHHostOs;
 	shell: SSHHostShell;
+	/** Target `user@host:port` this capability snapshot was probed against. */
+	fingerprint?: string;
 	/**
 	 * Shell name OMP verified can execute the POSIX transfer snippets
 	 * (`head`/`cat`/`mv`/`test`/`ls`) `ssh://` uses. Probed by running
@@ -384,6 +386,7 @@ export function parseHostInfo(value: unknown): SSHHostInfo | null {
 	const record = value as Record<string, unknown>;
 	const os = parseOs(record.os) ?? "unknown";
 	const shell = parseShell(record.shell) ?? "unknown";
+	const fingerprint = typeof record.fingerprint === "string" && record.fingerprint ? record.fingerprint : undefined;
 	const compatShell = parseCompatShell(record.compatShell);
 	const transferShell = parseTransferShell(record.transferShell);
 	const compatEnabled = typeof record.compatEnabled === "boolean" ? record.compatEnabled : false;
@@ -392,14 +395,20 @@ export function parseHostInfo(value: unknown): SSHHostInfo | null {
 		version,
 		os,
 		shell,
+		fingerprint,
 		transferShell,
 		compatShell,
 		compatEnabled,
 	};
 }
 
+function hostTargetFingerprint(host: SSHConnectionTarget): string {
+	return `${host.username ?? ""}@${host.host}:${host.port ?? ""}`;
+}
+
 function shouldRefreshHostInfo(host: SSHConnectionTarget, info: SSHHostInfo): boolean {
 	if (info.version !== HOST_INFO_VERSION) return true;
+	if (info.fingerprint !== undefined && info.fingerprint !== hostTargetFingerprint(host)) return true;
 	if (info.os === "unknown") return true;
 	if (info.os !== "windows" && info.compatEnabled) return true;
 	if (info.os === "windows" && info.compatEnabled && !info.compatShell) return true;
@@ -412,13 +421,16 @@ function shouldRefreshHostInfo(host: SSHConnectionTarget, info: SSHHostInfo): bo
 	if (info.os !== "windows" && !info.transferShell) return true;
 	return false;
 }
+function matchesHostTarget(host: SSHConnectionTarget, info: SSHHostInfo): boolean {
+	return info.fingerprint === undefined || info.fingerprint === hostTargetFingerprint(host);
+}
 
 async function loadHostInfoFromDisk(host: SSHConnectionTarget): Promise<SSHHostInfo | undefined> {
 	const path = getHostInfoPath(host.name);
 	try {
 		const raw = await fs.promises.readFile(path, "utf-8");
 		const parsed = parseHostInfo(JSON.parse(raw));
-		if (!parsed) return undefined;
+		if (!parsed || !matchesHostTarget(host, parsed)) return undefined;
 		const resolved = applyCompatOverride(host, parsed);
 		hostInfoCache.set(host.name, resolved);
 		return resolved;
@@ -546,6 +558,7 @@ async function probeHostInfo(host: SSHConnectionTarget): Promise<SSHHostInfo> {
 			version: HOST_INFO_VERSION,
 			os: transferProbe.shell ? (osFromUname(transferProbe.uname) ?? "unknown") : "unknown",
 			shell: "unknown",
+			fingerprint: hostTargetFingerprint(host),
 			transferShell: transferProbe.shell,
 			compatShell: undefined,
 			compatEnabled: false,
@@ -629,6 +642,7 @@ async function probeHostInfo(host: SSHConnectionTarget): Promise<SSHHostInfo> {
 		version: HOST_INFO_VERSION,
 		os,
 		shell,
+		fingerprint: hostTargetFingerprint(host),
 		transferShell,
 		compatShell,
 		compatEnabled,
@@ -647,7 +661,7 @@ export async function getHostInfo(hostName: string): Promise<SSHHostInfo | undef
 
 export async function getHostInfoForHost(host: SSHConnectionTarget): Promise<SSHHostInfo | undefined> {
 	const cached = hostInfoCache.get(host.name);
-	if (cached) {
+	if (cached && matchesHostTarget(host, cached)) {
 		const resolved = applyCompatOverride(host, cached);
 		if (resolved !== cached) hostInfoCache.set(host.name, resolved);
 		return resolved;
@@ -664,14 +678,14 @@ export async function getHostInfoForHost(host: SSHConnectionTarget): Promise<SSH
  */
 export function getCachedHostInfoSync(host: SSHConnectionTarget): SSHHostInfo | undefined {
 	const cached = hostInfoCache.get(host.name);
-	if (cached) {
+	if (cached && matchesHostTarget(host, cached)) {
 		const resolved = applyCompatOverride(host, cached);
 		if (resolved !== cached) hostInfoCache.set(host.name, resolved);
 		return resolved;
 	}
 	try {
 		const parsed = parseHostInfo(JSON.parse(fs.readFileSync(getHostInfoPath(host.name), "utf-8")));
-		if (!parsed) return undefined;
+		if (!parsed || !matchesHostTarget(host, parsed)) return undefined;
 		const resolved = applyCompatOverride(host, parsed);
 		hostInfoCache.set(host.name, resolved);
 		return resolved;

@@ -13,6 +13,7 @@ import { plainText } from "../native/spans";
 import type { FileDiagnosticsResult } from "./lsp";
 import { formatArtifactErrorNotice, formatTruncationMetaNotice, type OutputMeta } from "./output-meta";
 import type { NativeToolHead, NativeToolView, ToolRenderResult } from "./renderer";
+import { isSshSession } from "../terminal-capabilities";
 
 /** A path for native heads: relative to the working directory when inside it, else `~`-shortened. */
 export function displayPath(filePath: string): string {
@@ -25,7 +26,7 @@ export function displayPath(filePath: string): string {
 
 /** `file://` link for a head's path target, when the path is absolute. */
 export function fileHref(filePath: string | undefined): string | undefined {
-	return filePath && path.isAbsolute(filePath) ? pathToFileURL(filePath).href : undefined;
+	return filePath && path.isAbsolute(filePath) && !isSshSession() ? pathToFileURL(filePath).href : undefined;
 }
 
 /** Diff stats as one head `meta` string, `+8 −1` (U+2212 minus), or undefined when nothing changed. */

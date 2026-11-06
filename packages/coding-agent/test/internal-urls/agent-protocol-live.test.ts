@@ -198,4 +198,42 @@ describe("agent:// for agents without a published output", () => {
 		expect(error?.message).toContain("CodeBuildFolderSources");
 		expect(error?.message).not.toContain("Unrelated");
 	});
+
+	it("resolves a pending agent waiting on a concurrency slot instead of throwing Not found", async () => {
+		AgentRegistry.global().registerPending({
+			id: "DemandVisitUI",
+			displayName: "task",
+			parentId: "Main",
+			assignment: "Build demand visit UI",
+		});
+
+		const resource = await InternalUrlRouter.instance().resolve("agent://DemandVisitUI", {
+			sessionFile: rootSessionFile,
+		});
+		expect(resource.content).toContain("DemandVisitUI (pending — waiting for concurrency slot)");
+
+		const historyResource = await InternalUrlRouter.instance().resolve("history://DemandVisitUI", {
+			sessionFile: rootSessionFile,
+		});
+		expect(historyResource.content).toContain("DemandVisitUI (queued)");
+		expect(historyResource.content).toContain("waiting for a concurrency slot");
+	});
+
+	it("reports terminal state for an aborted/failed agent with no published artifact instead of Not found or Unknown agent", async () => {
+		AgentRegistry.global().recordTerminal({
+			id: "MapFix",
+			displayName: "task",
+			parentId: "Main",
+			outcome: "aborted",
+			error: "Aborted before execution",
+		});
+
+		await expect(
+			InternalUrlRouter.instance().resolve("agent://MapFix", { sessionFile: rootSessionFile }),
+		).rejects.toThrow('Agent "MapFix" has already aborted (Aborted before execution) without publishing output');
+
+		await expect(
+			InternalUrlRouter.instance().resolve("history://MapFix", { sessionFile: rootSessionFile }),
+		).rejects.toThrow('Agent "MapFix" has already aborted (Aborted before execution) and left no transcript on disk');
+	});
 });

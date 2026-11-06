@@ -7,7 +7,7 @@ import { sessionFilesFromDisk } from "../internal-urls/registry-helpers";
 import seanceAssignmentTemplate from "../prompts/system/seance-assignment.md" with { type: "text" };
 import seanceTaskGuidanceTemplate from "../prompts/tools/seance-task-guidance.md" with { type: "text" };
 import { buildSessionContext, getRestorableSessionModels } from "../session/session-context";
-import { listSessionsReadOnly } from "../session/session-listing";
+import { findSessionFiles, listSessionsReadOnly, sessionIdFromSessionPath } from "../session/session-listing";
 import { sessionDirForCwd } from "../session/session-paths";
 import { resolveSessionLeafId, type SessionEntry } from "../session/session-entries";
 import { FileSessionStorage, type SessionStorage } from "../session/session-storage";
@@ -24,6 +24,8 @@ import type { AgentDefinition } from "./types";
 export interface ResolvedSeanceSource {
 	file: string;
 	id: string;
+	/** Working directory recorded in the source session's header, when present. */
+	cwd?: string;
 	/** Active saved model-role selector, then the saved default fallback. */
 	modelSelectors: string[];
 }
@@ -99,13 +101,24 @@ async function validateSourceFile(file: string, storage: SessionStorage): Promis
 		throw new Error("The selected file does not contain a valid session header.");
 	}
 	const entries = loaded.entries.filter((entry): entry is SessionEntry => entry.type !== "session");
-	return { file, id: header.id, modelSelectors: savedModelSelectors(entries) };
+	if (!entries.some(entry => entry.type === "message")) {
+		throw new Error("The selected session contains no conversation to consult.");
+	}
+	return {
+		file,
+		id: header.id,
+		cwd: typeof header.cwd === "string" && header.cwd.trim().length > 0 ? header.cwd : undefined,
+		modelSelectors: savedModelSelectors(entries),
+	};
 }
 
 /**
  * Resolve an explicit session path or an unambiguous stored session id without opening its writer.
- * Ids search the caller's artifact tree, then the current project; `includeGlobal` (user-typed
- * `/seance` ids) also searches every project's sessions.
+ * Ids search the caller's artifact tree, then the current project. With `includeGlobal` they then
+ * search every project's sessions — cheaply by `<timestamp>_<id>.jsonl` filename (the same view
+ * `archive` lists, `-tmp` buckets included), then by header scan for ids that diverged from the
+ * filename. `listAll` alone misses nothing the glob finds, but the glob skips the full scan for
+ * the canonical id-prefix case.
  */
 export async function resolveSeanceSource(
 	selector: string,
@@ -151,17 +164,47 @@ export async function resolveSeanceSource(
 	const localMatch = chooseId(local, source);
 	if (localMatch) return validateSourceFile(localMatch.path, storage);
 	if (options.includeGlobal) {
-		const matchGlobal = chooseId(await SessionManager.listAll(storage), source);
+		const byFileName = (await findSessionFiles(source)).flatMap(file => {
+			const id = sessionIdFromSessionPath(file);
+			return id ? [{ id, path: file }] : [];
+		});
+		const matchGlobal = chooseId(byFileName, source) ?? chooseId(await SessionManager.listAll(storage), source);
 		if (matchGlobal) return validateSourceFile(matchGlobal.path, storage);
 	}
 	throw new Error(`Session "${label}" was not found.`);
 }
-const modelSelectorInputSchema = type("string | string[]");
+const modelSelectorInputSchema = type("string | string[]").describe(
+	"`seance` agent only: model selector (or ordered selectors) for consulting `sourceSession`; the saved source model is used when omitted. Other agents reject this field.",
+);
 export const seanceTaskSchemaFields = {
-	"sourceSession?": type("string"),
+	"sourceSession?": type("string").describe(
+		"`seance` agent only: session id, id prefix, or .jsonl path to consult; ids resolve across every project's sessions, not just this one.",
+	),
 	"model?": modelSelectorInputSchema,
 };
 export const seanceTaskGuidance = seanceTaskGuidanceTemplate;
+
+/**
+ * Drop blank seance fields in place, before validation and spawn planning see the call.
+ * Providers that cannot omit an object member emit `""`/`[]` instead; treating those as
+ * absent keeps an ordinary task from failing on an empty `model`, and lets `seance`
+ * fall back to the source's saved model — an explicit `model` never silently replaces it.
+ */
+export function normalizeSeanceTaskFields(item: TaskItem | TaskParams): void {
+	if (typeof item.sourceSession === "string" && item.sourceSession.trim().length === 0) {
+		delete item.sourceSession;
+	}
+	const model: unknown = item.model;
+	if (typeof model === "string") {
+		if (model.trim().length === 0) delete item.model;
+		return;
+	}
+	if (!Array.isArray(model)) return;
+	// Blank members are dropped; malformed ones are kept so validation still rejects them.
+	const selectors = model.filter(value => typeof value !== "string" || value.trim().length > 0);
+	if (selectors.length === 0) delete item.model;
+	else if (selectors.length !== model.length) item.model = selectors as string[];
+}
 
 function validateSeanceFields(
 	item: TaskItem | TaskParams,
@@ -238,11 +281,30 @@ export async function prepareSeance(context: {
 		throw new Error("Seance does not support plan mode, isolated execution, or custom tools.");
 	}
 	const sessionFile = context.session.getSessionFile();
+	// Historical consults reach every project's sessions, like the `archive` view the
+	// caller picks ids from; without `includeGlobal` a cross-project id fails while the
+	// same session's full path works.
 	const source = await resolveSeanceSource(sourceSelector, {
 		cwd: context.session.cwd,
 		sessionDirHint: sessionFile ? path.dirname(sessionFile) : undefined,
 		artifactsDirHint: context.session.getArtifactsDir?.() ?? undefined,
+		includeGlobal: true,
 	});
+	const sourceWorkspace = source.cwd;
+	// A fork reuses this session's cwd: absolute paths the transcript quotes from a
+	// different workspace — or one that does not exist on this machine — do not resolve
+	// locally, so the child needs the caveat instead of reading them blind.
+	const sourceWorkspaceNote =
+		sourceWorkspace === undefined
+			? undefined
+			: path.resolve(sourceWorkspace) !== path.resolve(context.session.cwd)
+				? (await fs.stat(sourceWorkspace).then(
+						() => true,
+						() => false,
+					))
+					? "it differs from the current workspace — absolute paths it quotes may not resolve here"
+					: "it is not accessible on this machine — absolute paths it quotes will not resolve"
+				: undefined;
 	const modelRegistry = context.session.modelRegistry;
 	if (!modelRegistry) throw new Error("Seance cannot resolve a model in this session.");
 	await modelRegistry.awaitBackgroundRefresh().catch(() => {});
@@ -285,6 +347,8 @@ export async function prepareSeance(context: {
 			promptSuffix: resolvedModel =>
 				prompt.render(seanceAssignmentTemplate, {
 					sourceSession: safeSourceLabel(source.id),
+					sourceWorkspace: sourceWorkspace ?? "unknown",
+					sourceWorkspaceNote: sourceWorkspaceNote ?? "",
 					model: resolvedModel ?? "",
 				}),
 		},

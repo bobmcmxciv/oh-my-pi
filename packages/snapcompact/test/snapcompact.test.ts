@@ -1955,4 +1955,87 @@ describe("data URL elision", () => {
 			`${snapcompact.DIM_ON}${"[".repeat(1200)} ${marker} ${"[".repeat(792)};base64,${snapcompact.DIM_OFF}`,
 		);
 	}, 2_000);
+
+	it("preserves active todo ledger and mid-session user prompt directives in plain text across multiple compactions and model switches", async () => {
+		const todoResult: Message = {
+			role: "toolResult",
+			toolCallId: "todo-1",
+			toolName: "todo",
+			content: [
+				{
+					type: "text",
+					text: [
+						"Overall: 1/3 done, 2 open.",
+						"# 实现与集成",
+						"- [x] 整合补充信息并排除企查查重复公开信息",
+						"- [/] 全量2268家企业使用gpt-6.1-terra结合联网重刷 (in progress)",
+						"- [ ] 实现上海哒哒张双发网页通信JS方法并部署至DESKTOP-4SQALMG",
+					].join("\n"),
+				},
+			],
+			isError: false,
+			timestamp: 10,
+		};
+
+		const round1 = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createUserMessage(
+						"<system-reminder>Today: 2026-11-06</system-reminder>\n请基于益流能源大厦本地白模制作3D模型，并提供iOS/Android/HarmonyOS三系统真机截图。",
+					),
+					createAssistantMessage([{ type: "thinking", thinking: "Initial planning thought" }]),
+					createToolResultMessage("building data ".repeat(400)),
+				],
+			}),
+			{ frameSize: TEST_FRAME_SIZE, maxFrames: 2 },
+		);
+
+		const round2 = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createUserMessage(
+						'<hapi_user_context user="admin">context</hapi_user_context>\n10月22日与上海哒哒张双发沟通的网页通信JS方法是否已实现？另外请用gpt-6.1-terra结合联网重新生成全部2268家企业信息。',
+					),
+					todoResult,
+					createToolResultMessage("refresh output ".repeat(400)),
+				],
+				previousSummary: round1.summary,
+				previousPreserveData: round1.preserveData,
+			}),
+			{ frameSize: TEST_FRAME_SIZE, maxFrames: 2 },
+		);
+
+		const round3 = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createUserMessage("请将最终版本替换部署到 DESKTOP-4SQALMG 并清理本机临时服务。"),
+					createToolResultMessage("deploy logs ".repeat(400)),
+				],
+				previousSummary: round2.summary,
+				previousPreserveData: round2.preserveData,
+			}),
+			{ frameSize: TEST_FRAME_SIZE, maxFrames: 2 },
+		);
+
+		expect(round3.summary).toContain("ACTIVE TODOS");
+		expect(round3.summary).toContain("全量2268家企业使用gpt-6.1-terra结合联网重刷 (in progress)");
+		expect(round3.summary).toContain("实现上海哒哒张双发网页通信JS方法并部署至DESKTOP-4SQALMG");
+		expect(round3.summary).toContain("USER DIRECTIVES");
+		expect(round3.summary).toContain("请基于益流能源大厦本地白模制作3D模型");
+		expect(round3.summary).toContain("10月22日与上海哒哒张双发沟通的网页通信JS方法是否已实现？");
+		expect(round3.summary).toContain("请将最终版本替换部署到 DESKTOP-4SQALMG 并清理本机临时服务。");
+		expect(round3.summary).not.toContain("<system-reminder>");
+		expect(round3.summary).not.toContain("<hapi_user_context");
+		expect(round3.shortSummary).toContain("chars as text)");
+
+		const archive3 = snapcompact.getPreservedArchive(round3.preserveData)!;
+		expect(archive3.todoState).toContain("全量2268家企业使用gpt-6.1-terra结合联网重刷");
+		expect(archive3.userPrompts).toHaveLength(3);
+
+		const claudeView = snapcompact.viewWithoutThinking(round3.summary, archive3, round3.details);
+		expect(claudeView.summary).toContain("ACTIVE TODOS");
+		expect(claudeView.summary).toContain("USER DIRECTIVES");
+		expect(claudeView.summary).toContain("10月22日与上海哒哒张双发沟通的网页通信JS方法是否已实现？");
+		expect(claudeView.summary).not.toContain("¶think:");
+	});
 });

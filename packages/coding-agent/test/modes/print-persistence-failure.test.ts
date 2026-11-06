@@ -86,6 +86,34 @@ function assistantSession(manager: SessionManager, dispose: () => Promise<void>)
 }
 
 describe("headless persistence-failure surface", () => {
+	it("includes authoritative relocation paths and reason in RPC persistence notices", async () => {
+		const manager = makeSessionManager();
+		const notice = { reason: "open-elsewhere" as const, from: "/sessions/old.jsonl", to: "/sessions/new.jsonl" };
+		const observer = spyOn(manager, "onPersistenceNotice").mockImplementation(listener => {
+			listener(notice);
+			return () => {};
+		});
+		const frames: object[] = [];
+		const stderr = captureStderr();
+		let unsubscribe: (() => void) | undefined;
+		try {
+			unsubscribe = registerRpcPersistenceSurface({ sessionManager: manager }, frame => frames.push(frame));
+			expect(frames).toEqual([
+				expect.objectContaining({
+					type: "notice",
+					level: "warning",
+					source: "session-persistence",
+					...notice,
+				}),
+			]);
+		} finally {
+			unsubscribe?.();
+			observer.mockRestore();
+			stderr.restore();
+			await manager.close();
+		}
+	});
+
 	it("reports the store failure on stderr and returns a nonzero code from print mode", async () => {
 		const manager = makeSessionManager();
 		// No session file exists until an assistant message does, so the appends

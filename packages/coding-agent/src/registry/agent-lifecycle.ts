@@ -400,6 +400,12 @@ export class AgentLifecycleManager {
 
 		let ref = this.#registry.get(id);
 		if (!ref) {
+			const terminal = this.#registry.getTerminal(id);
+			if (terminal) {
+				throw new Error(
+					`Agent "${id}" has already ${terminal.outcome}${terminal.error ? ` (${terminal.error})` : ""} and cannot be revived. Read agent://${id} or history://${id} for its output.`,
+				);
+			}
 			throw new Error(
 				`Unknown agent "${id}" — it was never registered or has been released. If a transcript exists, read history://${id}.`,
 			);
@@ -498,8 +504,10 @@ export class AgentLifecycleManager {
 			throw new Error(`Agent "${id}" changed while its persisted session was being prepared.`);
 		}
 		if (ref.status !== "parked" || !revive || !adoption) {
+			const terminal = this.#registry.getTerminal(id);
+			const outcomeLabel = terminal ? `has already ${terminal.outcome}` : `is ${ref.status}`;
 			throw new Error(
-				`Agent "${id}" is ${ref.status} and cannot be revived${revive ? "" : " (no reviver registered)"}. Its transcript remains readable at history://${id}.`,
+				`Agent "${id}" ${outcomeLabel} and cannot be revived${revive ? "" : " (no reviver registered)"}. Its transcript remains readable at history://${id}.`,
 			);
 		}
 		try {
@@ -541,6 +549,16 @@ export class AgentLifecycleManager {
 		if (adopted?.ref === ref) {
 			clearTimeout(adopted.timer);
 			this.#adopted.delete(id);
+		}
+		if (!this.#registry.getTerminal(id) || options?.tombstone) {
+			this.#registry.recordTerminal({
+				id,
+				displayName: ref.displayName,
+				parentId: ref.parentId,
+				outcome: options?.tombstone || ref.status === "aborted" ? "aborted" : "completed",
+				sessionFile: ref.sessionFile,
+				outputPath: ref.history?.outputPath,
+			});
 		}
 
 		const park = this.#parks.get(id);

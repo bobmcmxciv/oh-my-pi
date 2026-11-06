@@ -248,6 +248,13 @@ describe("structured subagent primitive", () => {
 					model: "anthropic/claude-sonnet-4-6",
 					role: "fast",
 				},
+				{
+					type: "message",
+					id: "source-user",
+					parentId: "active-model",
+					timestamp: "2026-10-01T00:00:03.000Z",
+					message: { role: "user", content: "consult me", timestamp: 1 },
+				},
 			]
 				.map(entry => JSON.stringify(entry))
 				.join("\n")}\n`,
@@ -290,7 +297,18 @@ describe("structured subagent primitive", () => {
 		await fs.mkdir(path.dirname(sourceFile), { recursive: true });
 		await Bun.write(
 			sourceFile,
-			`${JSON.stringify({ type: "session", version: 3, id: "no-model-source", timestamp: "2026-10-01T00:00:00.000Z", cwd })}\n`,
+			`${[
+				{ type: "session", version: 3, id: "no-model-source", timestamp: "2026-10-01T00:00:00.000Z", cwd },
+				{
+					type: "message",
+					id: "source-user",
+					parentId: null,
+					timestamp: "2026-10-01T00:00:01.000Z",
+					message: { role: "user", content: "consult me", timestamp: 1 },
+				},
+			]
+				.map(entry => JSON.stringify(entry))
+				.join("\n")}\n`,
 		);
 		const caller = Object.assign(session({ cwd }), { modelRegistry });
 		try {

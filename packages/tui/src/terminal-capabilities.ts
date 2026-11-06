@@ -509,6 +509,8 @@ export function resolveWarpImageProtocol(
 	platform: NodeJS.Platform = process.platform,
 	env: NodeJS.ProcessEnv = Bun.env,
 ): ImageProtocol | null {
+	// Over SSH `platform` is the remote server's OS, not the client running Warp.
+	if (isSshSession(env)) return null;
 	const windowsHost = platform === "win32" || isWsl(platform, env);
 	return windowsHost ? null : ImageProtocol.Kitty;
 }

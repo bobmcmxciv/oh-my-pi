@@ -819,4 +819,85 @@ describe("IRC", () => {
 			expect(parentSteer.content).toContain("change approach");
 		});
 	});
+
+	it("queues messages for a pending agent waiting on a concurrency slot and auto-delivers on session attach", async () => {
+		registry.registerPending({
+			id: "Supplement",
+			displayName: "task",
+			parentId: "Main",
+			assignment: "Implement supplement module",
+		});
+
+		const sendRes = await executeSend(
+			{ registry, senderId: "Main" },
+			{ to: "Supplement", message: "Contract: return supplementGroups from getExtraInfo" },
+		);
+		expect(sendRes.isError).toBe(false);
+		expect(sendRes.content[0]?.type === "text" ? sendRes.content[0].text : "").toBe(
+			'Queued message for pending agent "Supplement" (waiting for concurrency slot).',
+		);
+		expect(bus.unreadCount("Supplement")).toBe(1);
+
+		// Now the concurrency slot frees up and Supplement's session attaches.
+		const sub = makeFakeSession();
+		registry.register({ id: "Supplement", displayName: "task", kind: "sub", parentId: "Main", session: null });
+		registry.attachSession("Supplement", sub.session);
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(sub.delivered.map(msg => msg.body)).toEqual(["Contract: return supplementGroups from getExtraInfo"]);
+		expect(bus.unreadCount("Supplement")).toBe(0);
+	});
+
+	it("distinguishes completed, failed, and aborted terminal agents from unknown agents", async () => {
+		registry.recordTerminal({
+			id: "DoneWorker",
+			displayName: "task",
+			parentId: "Main",
+			outcome: "completed",
+		});
+		registry.recordTerminal({
+			id: "FailedWorker",
+			displayName: "task",
+			parentId: "Main",
+			outcome: "failed",
+			error: "exit 1",
+		});
+		registry.recordTerminal({
+			id: "CancelledQueuedWorker",
+			displayName: "task",
+			parentId: "Main",
+			outcome: "aborted",
+			error: "Aborted before execution",
+		});
+
+		const completedSend = await executeSend({ registry, senderId: "Main" }, { to: "DoneWorker", message: "status?" });
+		expect(completedSend.isError).toBe(true);
+		const completedText = completedSend.content[0]?.type === "text" ? completedSend.content[0].text : "";
+		expect(completedText).toContain('Agent "DoneWorker" has already completed');
+		expect(completedText).not.toContain("Unknown agent");
+
+		const failedSend = await executeSend({ registry, senderId: "Main" }, { to: "FailedWorker", message: "status?" });
+		expect(failedSend.isError).toBe(true);
+		const failedText = failedSend.content[0]?.type === "text" ? failedSend.content[0].text : "";
+		expect(failedText).toContain('Agent "FailedWorker" has already failed (exit 1)');
+		expect(failedText).not.toContain("Unknown agent");
+
+		const abortedSend = await executeSend(
+			{ registry, senderId: "Main" },
+			{ to: "CancelledQueuedWorker", message: "status?" },
+		);
+		expect(abortedSend.isError).toBe(true);
+		const abortedText = abortedSend.content[0]?.type === "text" ? abortedSend.content[0].text : "";
+		expect(abortedText).toContain('Agent "CancelledQueuedWorker" has already aborted');
+		expect(abortedText).not.toContain("Unknown agent");
+
+		const unknownSend = await executeSend(
+			{ registry, senderId: "Main" },
+			{ to: "MisspelledAgentName", message: "status?" },
+		);
+		expect(unknownSend.isError).toBe(true);
+		const unknownText = unknownSend.content[0]?.type === "text" ? unknownSend.content[0].text : "";
+		expect(unknownText).toContain('Unknown agent "MisspelledAgentName"');
+	});
 });

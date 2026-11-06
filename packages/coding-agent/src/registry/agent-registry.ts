@@ -82,6 +82,31 @@ export interface AgentRef {
 	lifecycle?: AgentRunLifecycle;
 }
 
+/** Reservation for a subagent that has been scheduled (`task`) and is waiting for a concurrency slot or session initialization. */
+export interface PendingAgentRef {
+	id: string;
+	displayName: string;
+	parentId?: string;
+	assignment?: string;
+	createdAt: number;
+}
+
+export type AgentTerminalOutcome = "completed" | "failed" | "aborted";
+
+/** Terminal outcome retained after a subagent run finishes or is released/aborted. */
+export interface TerminalAgentRef {
+	id: string;
+	displayName: string;
+	parentId?: string;
+	outcome: AgentTerminalOutcome;
+	error?: string;
+	completedAt: number;
+	sessionFile?: string | null;
+	outputPath?: string;
+}
+
+type SessionAttachedListener = (ref: AgentRef, session: AgentSession) => void;
+
 export type AgentRefExpectation = AgentRef | AgentSession;
 
 /**
@@ -138,10 +163,12 @@ export class AgentRegistry {
 	}
 
 	readonly #refs = new Map<string, AgentRef>();
+	readonly #pending = new Map<string, PendingAgentRef>();
+	readonly #terminal = new Map<string, TerminalAgentRef>();
 	readonly #listeners = new Set<RegistryListener>();
+	readonly #sessionAttachedListeners = new Set<SessionAttachedListener>();
 	/** Which of these agents are blocked until others finish. */
 	readonly awaits = new AgentAwaits();
-
 	#matchesExpected(ref: AgentRef, expected?: AgentRefExpectation): boolean {
 		return expected === undefined || ref === expected || ref.session === expected;
 	}
@@ -168,8 +195,131 @@ export class AgentRegistry {
 			lifecycle: input.lifecycle,
 		};
 		this.#refs.set(ref.id, ref);
+		this.#terminal.delete(ref.id);
+		if (input.session !== null) {
+			this.#pending.delete(ref.id);
+		}
 		this.#emit({ type: "registered", ref });
+		if (input.session !== null) {
+			this.#emitSessionAttached(ref, input.session);
+		}
 		return ref;
+	}
+
+	/**
+	 * Pre-register a queued subagent before it acquires a concurrency slot so
+	 * `agent://<id>` and `history://<id>` can distinguish a pending peer (and
+	 * buffer its initial inbox) from a misspelled unknown id.
+	 */
+	registerPending(input: {
+		id: string;
+		displayName: string;
+		parentId?: string;
+		assignment?: string;
+		createdAt?: number;
+	}): PendingAgentRef {
+		this.#terminal.delete(input.id);
+		const existing = this.#pending.get(input.id);
+		const entry: PendingAgentRef = {
+			id: input.id,
+			displayName: input.displayName,
+			parentId: input.parentId ?? existing?.parentId,
+			assignment: input.assignment ?? existing?.assignment,
+			createdAt: input.createdAt ?? existing?.createdAt ?? Date.now(),
+		};
+		this.#pending.set(input.id, entry);
+		return entry;
+	}
+
+	/**
+	 * Pending reservation for `id`, or a synthesized one while a fresh subagent
+	 * is mid-construction (`status === "running"` with `session === null`).
+	 */
+	getPending(id: string): PendingAgentRef | undefined {
+		const pending = this.#pending.get(id);
+		const ref = this.#refs.get(id);
+		if (ref?.session) return undefined;
+		if (pending) return pending;
+		if (ref && ref.kind === "sub" && ref.status === "running" && !ref.session) {
+			return {
+				id: ref.id,
+				displayName: ref.displayName,
+				parentId: ref.parentId,
+				createdAt: ref.createdAt,
+			};
+		}
+		return undefined;
+	}
+
+	listPending(): PendingAgentRef[] {
+		return [...this.#pending.values()];
+	}
+
+	clearPending(id: string): boolean {
+		return this.#pending.delete(id);
+	}
+
+	/**
+	 * Record the terminal outcome (`completed`, `failed`, `aborted`) of a
+	 * subagent run so post-completion `agent://<id>` lookups report its terminal
+	 * state instead of `Unknown agent`.
+	 */
+	recordTerminal(input: {
+		id: string;
+		displayName?: string;
+		parentId?: string;
+		outcome: AgentTerminalOutcome;
+		error?: string;
+		sessionFile?: string | null;
+		outputPath?: string;
+		completedAt?: number;
+	}): TerminalAgentRef {
+		const priorPending = this.#pending.get(input.id);
+		this.#pending.delete(input.id);
+		const ref = this.#refs.get(input.id);
+		const priorTerminal = this.#terminal.get(input.id);
+		const entry: TerminalAgentRef = {
+			id: input.id,
+			displayName:
+				input.displayName ?? ref?.displayName ?? priorPending?.displayName ?? priorTerminal?.displayName ?? "task",
+			parentId: input.parentId ?? ref?.parentId ?? priorPending?.parentId ?? priorTerminal?.parentId,
+			outcome: input.outcome,
+			...(input.error !== undefined
+				? { error: input.error }
+				: priorTerminal?.error !== undefined
+					? { error: priorTerminal.error }
+					: {}),
+			completedAt: input.completedAt ?? Date.now(),
+			sessionFile: input.sessionFile ?? ref?.sessionFile ?? priorTerminal?.sessionFile ?? null,
+			...(input.outputPath !== undefined
+				? { outputPath: input.outputPath }
+				: priorTerminal?.outputPath !== undefined
+					? { outputPath: priorTerminal.outputPath }
+					: {}),
+		};
+		this.#terminal.set(input.id, entry);
+		return entry;
+	}
+
+	/** Terminal state for an agent that is no longer running or live. */
+	getTerminal(id: string): TerminalAgentRef | undefined {
+		if (this.getPending(id)) return undefined;
+		const ref = this.#refs.get(id);
+		if (ref?.session && (ref.status === "running" || ref.status === "idle")) return undefined;
+		const recorded = this.#terminal.get(id);
+		if (recorded) return recorded;
+		if (ref?.status === "aborted") {
+			return {
+				id: ref.id,
+				displayName: ref.displayName,
+				parentId: ref.parentId,
+				outcome: "aborted",
+				completedAt: ref.lifecycle?.terminalAt ?? ref.lastActivity,
+				sessionFile: ref.sessionFile,
+				...(ref.history?.outputPath ? { outputPath: ref.history.outputPath } : {}),
+			};
+		}
+		return undefined;
 	}
 
 	/**
@@ -347,6 +497,8 @@ export class AgentRegistry {
 		// createAgentSession after an explicit kill.
 		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
 		ref.session = session;
+		this.#pending.delete(id);
+		this.#terminal.delete(id);
 		if (sessionFile !== undefined) {
 			// A replacement transcript starts a new cumulative-cost identity.
 			if (ref.sessionFile !== sessionFile && ref.history?.directCost !== undefined) {
@@ -355,6 +507,7 @@ export class AgentRegistry {
 			ref.sessionFile = sessionFile;
 		}
 		ref.lastActivity = Date.now();
+		this.#emitSessionAttached(ref, session);
 		return true;
 	}
 
@@ -409,6 +562,21 @@ export class AgentRegistry {
 	onChange(listener: RegistryListener): () => void {
 		this.#listeners.add(listener);
 		return () => this.#listeners.delete(listener);
+	}
+
+	onSessionAttached(listener: SessionAttachedListener): () => void {
+		this.#sessionAttachedListeners.add(listener);
+		return () => this.#sessionAttachedListeners.delete(listener);
+	}
+
+	#emitSessionAttached(ref: AgentRef, session: AgentSession): void {
+		for (const listener of this.#sessionAttachedListeners) {
+			try {
+				listener(ref, session);
+			} catch {
+				// listeners must not break session attachment
+			}
+		}
 	}
 
 	#emit(event: RegistryEvent): void {

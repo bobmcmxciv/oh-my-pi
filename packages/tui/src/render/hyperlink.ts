@@ -8,7 +8,7 @@
 import * as url from "node:url";
 import type { TspSpan } from "@oh-my-pi/pi-wire";
 import { span } from "../native/describe";
-import { setTerminalHyperlinks, TERMINAL, type TerminalId } from "../terminal-capabilities";
+import { isSshSession, setTerminalHyperlinks, TERMINAL, type TerminalId } from "../terminal-capabilities";
 
 const OSC = "\x1b]";
 const ST = "\x1b\\";
@@ -207,7 +207,7 @@ export function isNativeLinkEnabled(): boolean {
  * text). Honours an explicit `off` policy.
  */
 export function fileLinkSpan(filePath: string, displayText: string, s = "path"): TspSpan {
-	if (hyperlinkMode === "off") return span(displayText, s);
+	if (hyperlinkMode === "off" || isSshSession()) return span(displayText, s);
 	const href = safeHyperlinkUri(url.pathToFileURL(filePath).href);
 	return href ? span(displayText, s, { href }) : span(displayText, s);
 }
@@ -225,5 +225,6 @@ export function fileLinkSpan(filePath: string, displayText: string, s = "path"):
  * @param opts - Optional line/col position appended as `?line=N&col=M` query params
  */
 export function fileHyperlink(filePath: string, displayText: string, opts?: { line?: number; col?: number }): string {
+	if (isSshSession()) return displayText;
 	return wrapHyperlink(buildFileUri(filePath, opts), displayText);
 }

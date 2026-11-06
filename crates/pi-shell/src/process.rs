@@ -585,18 +585,21 @@ mod platform {
 			visited: &mut HashSet<u32>,
 			out: &mut Vec<Self>,
 		) {
-			let Some(children) = u32::try_from(self.pid).ok().and_then(|pid| tree.get(&pid)) else {
+			let Ok(pid) = u32::try_from(self.pid) else {
+				return;
+			};
+			let Some(children) = tree.get(&pid) else {
 				return;
 			};
 			for &child_pid in children {
 				if !visited.insert(child_pid) {
 					continue;
 				}
+				// A missing or rejected identity is not evidence of ancestry. In
+				// particular, never walk through a PID-reused unrelated process.
 				let Some(child) = self.child(child_pid) else {
 					continue;
 				};
-				// Post-order: collect grandchildren first so leaves are signalled
-				// before their parents during tree termination.
 				child.collect_descendants_from_tree(tree, visited, out);
 				out.push(child);
 			}
@@ -841,7 +844,10 @@ impl Process {
 		timeout_ms: u32,
 		ct: CancelToken,
 	) -> Result<bool> {
-		if self.status() != ProcessStatus::Running {
+		// A dead root does not mean a dead tree: children orphaned under it
+		// still carry its recorded pid, so the waves below must run (and their
+		// walks must be taken) even when the root itself already exited.
+		if self.status() != ProcessStatus::Running && self.live_descendants().is_empty() {
 			return Ok(true);
 		}
 

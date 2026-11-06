@@ -4,7 +4,16 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLock, IpcConnection, IpcServer, Process, type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
-import { isEnoent, isRecord, logger, postmortem, procmgr, sanitizeText, setProcessName } from "@oh-my-pi/pi-utils";
+import {
+	isEnoent,
+	isRecord,
+	logger,
+	postmortem,
+	procmgr,
+	ptree,
+	sanitizeText,
+	setProcessName,
+} from "@oh-my-pi/pi-utils";
 import { TerminalQueryResponder } from "@oh-my-pi/pi-utils/vterm";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import {
@@ -89,6 +98,7 @@ const SIGNAL_NUMBER: Record<DaemonSignal, number> = {
 interface ManagedProcess {
 	pid: number;
 	exited: Promise<number>;
+	kill(signal?: number | NodeJS.Signals): void;
 	unref(): void;
 }
 
@@ -100,6 +110,13 @@ interface ManagedDaemon {
 	process?: ManagedProcess;
 	input?: Bun.FileSink;
 	pty?: PtySession;
+	/**
+	 * Root handle pinned at spawn. Keeping it outlives the child so `killTree`
+	 * can still enumerate (and terminate) children orphaned under a dead root —
+	 * a fresh `Process.fromPid(snapshot.pid)` at stop time opens nothing (or a
+	 * pid-recycling impostor) once the root is gone.
+	 */
+	processRef?: Process;
 	generation: number;
 	stopRequested: boolean;
 	logReady: boolean;
@@ -419,6 +436,26 @@ function connectPort(host: string, port: number): Promise<boolean> {
 	socket.once("error", () => finish(false));
 	socket.setTimeout(250, () => finish(false));
 	return promise;
+}
+
+/**
+ * Whether `ready.host` names this machine. Only a local port can be owned by
+ * the daemon's own tree, so only local probes are meaningful for the "is the
+ * port free" pre-check — a remote ready.host deliberately probes a service
+ * this broker does not run.
+ */
+function isLocalReadyHost(host: string | undefined): boolean {
+	if (host === undefined) return true;
+	const normalized = host.trim().toLowerCase();
+	return (
+		normalized === "localhost" ||
+		normalized === "127.0.0.1" ||
+		normalized === "::1" ||
+		normalized === "[::1]" ||
+		normalized === "0.0.0.0" ||
+		normalized === "::" ||
+		normalized === "[::]"
+	);
 }
 
 class DaemonBroker {
@@ -796,6 +833,7 @@ class DaemonBroker {
 		record.snapshot.exitCode = undefined;
 		record.snapshot.exitReason = undefined;
 		record.snapshot.pid = undefined;
+		record.processRef = undefined;
 		record.snapshot.readyMatch = undefined;
 		record.logReady = !record.spec.ready?.log;
 		record.portReady = record.spec.ready?.port === undefined;
@@ -804,6 +842,7 @@ class DaemonBroker {
 		record.outputOffset = 0;
 		this.#persist(record);
 		try {
+			await this.#assertReadyPortFree(record);
 			if (record.spec.detached) await this.#launchDetached(record, generation);
 			else if (record.spec.pty) await this.#launchPty(record, generation);
 			else this.#launchPipe(record, generation);
@@ -894,6 +933,7 @@ class DaemonBroker {
 
 		const pid = await started.promise;
 		if (pid !== undefined && generation === record.generation) {
+			record.processRef = ptree.pinProcess(pid);
 			record.snapshot.pid = pid;
 			this.#persist(record);
 		}
@@ -910,6 +950,7 @@ class DaemonBroker {
 		});
 		record.process = process;
 		record.input = process.stdin;
+		record.processRef = ptree.pinProcess(process.pid);
 		record.snapshot.pid = process.pid;
 		this.#persist(record);
 		const stdout = this.#drain(record, generation, process.stdout);
@@ -932,6 +973,7 @@ class DaemonBroker {
 				...DAEMON_SPAWN_OPTIONS,
 			});
 			record.process = process;
+			record.processRef = ptree.pinProcess(process.pid);
 			record.snapshot.pid = process.pid;
 			this.#persist(record);
 			process.unref();
@@ -1009,7 +1051,7 @@ class DaemonBroker {
 		const generation = record.generation;
 		await this.#readDetachedOutput(record, generation);
 		if (generation !== record.generation || record.process) return;
-		const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
+		const processRef = record.processRef ?? ptree.pinProcess(record.snapshot.pid);
 		if (processRef?.status() === "running") return;
 		await this.#settle(record, generation);
 	}
@@ -1019,6 +1061,25 @@ class DaemonBroker {
 			await Bun.sleep(100);
 			if (this.#shuttingDown || generation !== record.generation) return;
 			await this.#refreshDetached(record);
+		}
+	}
+
+	/**
+	 * Reject a launch whose `ready.port` is already served by another process.
+	 * Without the check the poll thread would mark the daemon ready the moment
+	 * it sees the *foreign* listener, then the child would die on EADDRINUSE —
+	 * the service reports "ready" while its own server never bound. Remote
+	 * hosts are exempt: they describe a service this broker does not run.
+	 */
+	async #assertReadyPortFree(record: ManagedDaemon): Promise<void> {
+		const ready = record.spec.ready;
+		if (ready?.port === undefined || !isLocalReadyHost(ready.host)) return;
+		const host = ready.host ?? "127.0.0.1";
+		if (await connectPort(host, ready.port)) {
+			throw new Error(
+				`ready.port ${ready.port} on ${host} is already in use by another process; ` +
+					`daemon ${record.spec.name} was not started and the existing listener was left running`,
+			);
 		}
 	}
 
@@ -1070,6 +1131,7 @@ class DaemonBroker {
 		record.process = undefined;
 		record.input = undefined;
 		record.pty = undefined;
+		record.processRef = undefined;
 		record.snapshot.pid = undefined;
 		record.snapshot.exitedAt = Date.now();
 		record.snapshot.exitCode = exitCode;
@@ -1261,7 +1323,7 @@ class DaemonBroker {
 				if (operation.signal === "SIGINT") record.pty.write("\u0003");
 				else record.pty.kill();
 			} else {
-				const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
+				const processRef = record.processRef ?? ptree.pinProcess(record.snapshot.pid);
 				if (!processRef) throw new Error(`Daemon ${operation.name} process is unavailable`);
 				processRef.killTree(SIGNAL_NUMBER[operation.signal]);
 			}
@@ -1285,11 +1347,32 @@ class DaemonBroker {
 		}
 		record.snapshot.state = "stopping";
 		this.#persist(record);
-		const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-		if (processRef) await processRef.terminate({ group: true, gracefulMs: timeoutMs, timeoutMs: timeoutMs + 1_000 });
-		else record.pty?.kill();
+		// The pinned spawn-time handle keeps identity across a dead or pid-recycled
+		// root; terminateProcessTree still sweeps descendants when the root itself
+		// is already gone (the case a bare terminate() silently skips).
+		const processRef = record.processRef ?? ptree.pinProcess(record.snapshot.pid);
+		if (processRef) {
+			await ptree.terminateProcessTree(processRef, {
+				group: true,
+				gracefulMs: timeoutMs,
+				timeoutMs: timeoutMs + 1_000,
+			});
+		} else if (record.pty) {
+			record.pty.kill();
+		} else if (record.process) {
+			record.process.kill("SIGKILL");
+		} else if (record.snapshot.pid !== undefined && process.platform !== "win32") {
+			await ptree.terminateProcessTree(record.snapshot.pid, {
+				group: true,
+				gracefulMs: timeoutMs,
+				timeoutMs: timeoutMs + 1_000,
+			});
+		}
 		const settled = await this.#waitUntil(record, () => terminalState(record.snapshot.state), timeoutMs + 1_000);
-		if (!settled && record.pty) record.pty.kill();
+		if (!settled) {
+			if (processRef) processRef.killTree(9);
+			if (record.pty) record.pty.kill();
+		}
 	}
 
 	async #restart(name: string): Promise<DaemonRpcResult> {
@@ -1444,7 +1527,11 @@ class DaemonBroker {
 					// exited; already-terminal records keep their real exit time so
 					// `list` ranks exited history by true recency (issue #6517).
 					if (!terminalState(snapshot.state) && processRef) {
-						await processRef.terminate({ group: true, gracefulMs: 500, timeoutMs: 2_000 });
+						await ptree.terminateProcessTree(processRef, {
+							group: true,
+							gracefulMs: 500,
+							timeoutMs: 2_000,
+						});
 					}
 					reapRecoveredSnapshot(snapshot, Date.now());
 				} else if (snapshot.state === "restarting") {
@@ -1456,6 +1543,9 @@ class DaemonBroker {
 					spec,
 					snapshot,
 					dir,
+					// A recovered detached daemon keeps the handle opened above: a
+					// later stop terminates *this* process, not a pid-recycling impostor.
+					processRef: detached ? (processRef ?? undefined) : undefined,
 					generation: 0,
 					stopRequested: !detached || snapshot.state === "stopping",
 					logReady: detached && (!spec.ready?.log || snapshot.state === "ready"),

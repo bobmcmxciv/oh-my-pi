@@ -127,6 +127,22 @@ describe("task schema seance fields", () => {
 			}
 		}
 	});
+	it("annotates the seance-only fields so the fields are never mistaken for ordinary spawn options", () => {
+		const schema = getTaskSchema({
+			isolationEnabled: false,
+			batchEnabled: false,
+			seanceFields: seanceTaskSchemaFields,
+		});
+		const wire = JSON.stringify(schema.toJsonSchema());
+		expect(wire).toContain("`seance` agent only");
+		// Both stay optional: `model` must never appear in `required` for any agent.
+		const shape = schema.toJsonSchema() as {
+			properties?: Record<string, { description?: string }>;
+			required?: string[];
+		};
+		expect(shape.required ?? []).not.toContain("model");
+		expect(shape.required ?? []).not.toContain("sourceSession");
+	});
 	it("omits seance fields when they are not enabled", () => {
 		for (const batchEnabled of [false, true]) {
 			for (const isolationEnabled of [false, true]) {
@@ -233,5 +249,32 @@ describe("task spawn validation", () => {
 		};
 		expect(schema(params) instanceof type.errors).toBe(false);
 		expect(await executeText(params, [bundledSeance])).toContain("`model` is only accepted for the `seance` agent.");
+	});
+
+	it("ignores blank model values instead of rejecting the call", async () => {
+		// Providers that cannot omit a member emit `""`/`[]`; a blank `model` is
+		// normalized away before agent validation, so ordinary tasks proceed.
+		for (const model of ["", "   ", [], ["", "  "]]) {
+			const text = await executeText({ agent: "scout", task: "Probe the cache.", model });
+			expect(text).toContain('Unknown agent "scout"');
+			expect(text).not.toContain("`model`");
+		}
+	});
+
+	it("treats a blank seance model as the saved-source default", async () => {
+		// `seance` with an empty `model` reaches the `sourceSession` requirement
+		// instead of failing on the selector: blank means "use the source's model".
+		for (const model of ["", []]) {
+			const text = await executeText({ agent: "seance", task: "Consult the incident log.", model }, [bundledSeance]);
+			expect(text).toContain("requires a non-empty `sourceSession`");
+		}
+	});
+
+	it("still rejects a non-empty model override for an ordinary task", async () => {
+		const text = await executeText(
+			{ agent: "scout", task: "Map the auth module.", model: ["anthropic/claude-sonnet-4-5"] },
+			[bundledSeance],
+		);
+		expect(text).toContain("`model` is only accepted for the `seance` agent.");
 	});
 });

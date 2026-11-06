@@ -296,6 +296,8 @@ export interface TurnRecoveryHost {
 	): Promise<RecoveryCompactionResult>;
 	shakeForRequestBodyReadTimeout(generation: number): Promise<boolean>;
 	withBashBranchTransition<T>(operation: () => T): T;
+	/** Optional hook fired when an active retry saga resolves so idle queues can flush. */
+	onRetryResolved?(): void;
 }
 
 /** Construction-time retry state restored from model selection. */
@@ -358,6 +360,7 @@ export class TurnRecovery {
 	#requestBodyReadTimeoutRecoveryPromptSequence: number | undefined;
 	#retryPromise: Promise<void> | undefined;
 	#retryResolve: (() => void) | undefined;
+	#preserveFailedTurnForAttempt: number | undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined;
 	#activeFallbackCreditRedemption?: {
 		targetSelector: string;
@@ -847,10 +850,15 @@ export class TurnRecovery {
 	/** Resolve the pending retry promise; the saga is over, and so is its refusal walk. */
 	resolveRetry(): void {
 		this.#refusalWalkTried.clear();
+		this.#preserveFailedTurnForAttempt = undefined;
+		const hadRetryPromise = this.#retryPromise !== undefined;
 		if (this.#retryResolve) {
 			this.#retryResolve();
 			this.#retryResolve = undefined;
 			this.#retryPromise = undefined;
+		}
+		if (hadRetryPromise) {
+			this.#host.onRetryResolved?.();
 		}
 	}
 
@@ -868,6 +876,10 @@ export class TurnRecovery {
 		end: RetrySagaEnd,
 		record: { terminalTurn?: AssistantMessage; retryErrors?: RetryErrorCompletion },
 	): Promise<void> {
+		// Zero #retryAttempt before awaiting persistence/event hooks so a scheduled
+		// continuation polling shouldContinue during disk I/O sees the saga closed.
+		this.#retryAttempt = 0;
+		this.#preserveFailedTurnForAttempt = undefined;
 		let retryErrors: RetryErrorUpdate[] | undefined;
 		try {
 			if (record.terminalTurn) await this.persistTerminalEmptyErrorTurn(record.terminalTurn);
@@ -2583,6 +2595,7 @@ export class TurnRecovery {
 			options?.preserveFailedTurn === true ||
 			((classifierRefusal || AIError.is(id, AIError.Flag.MalformedFunctionCall) || AIError.retriable(id)) &&
 				this.#unexecutedToolCallsReplaySafe(message));
+		this.#preserveFailedTurnForAttempt = preserveFailedTurn ? this.#retryAttempt : undefined;
 		const rateLimitReason = parseRateLimitReason(errorMessage);
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
@@ -2862,7 +2875,10 @@ export class TurnRecovery {
 			// A fallback model gets a fresh retry budget. Credential rotation
 			// instead keeps the cumulative attempt count while bypassing the
 			// same-route budget: every distinct account must be tried first.
-			if (switchedModel) this.#retryAttempt = 1;
+			if (switchedModel) {
+				this.#retryAttempt = 1;
+				this.#preserveFailedTurnForAttempt = preserveFailedTurn ? 1 : undefined;
+			}
 		}
 		if ((classifierRefusal || accountPolicyDenial) && !switchedCredential && !switchedModel) {
 			// A prior attempt in this saga already announced `auto_retry_start`
@@ -2998,6 +3014,7 @@ export class TurnRecovery {
 		// strip a still-failed assistant tail by position. Never when preserving
 		// the failed turn — the kept turn ends in synthetic tool results that
 		// continue() accepts — and never once a newer prompt owns the session.
+		const scheduledAttempt = this.#retryAttempt;
 		if (!preserveFailedTurn && this.#host.promptGeneration() === generation) {
 			this.#stripFailedAssistantTail();
 		}
@@ -3010,7 +3027,7 @@ export class TurnRecovery {
 			source: "automatic-retry",
 			delayMs: 1,
 			generation,
-			shouldContinue: () => this.#retryAttempt > 0,
+			shouldContinue: () => this.#retryAttempt === scheduledAttempt,
 			onError: error =>
 				void this.#failRetryAfterLocalContinueError(message, error).catch(failure =>
 					logger.error("Closing a retry saga after a failed local continuation threw", {
@@ -3046,16 +3063,34 @@ export class TurnRecovery {
 	 * and no recovery path wants it replayed on the wire, so drop it by
 	 * position; any healthy tail is left untouched.
 	 */
+	/**
+	 * Re-strip any trailing failed, aborted, or empty assistant placeholder right
+	 * before `agent.continue()` claims the loop for an automatic retry, unless
+	 * the current retry attempt intentionally preserved its failed turn.
+	 */
+	stripFailedAssistantTailForRetryContinue(): void {
+		if (this.#retryAttempt > 0 && this.#preserveFailedTurnForAttempt === this.#retryAttempt) return;
+		this.#stripFailedAssistantTail();
+	}
+
 	#stripFailedAssistantTail(): void {
 		const messages = this.#host.agent.state.messages;
-		const tail = messages[messages.length - 1];
-		if (tail?.role !== "assistant") return;
-		if (tail.stopReason !== "error" && tail.stopReason !== "aborted") return;
-		logger.debug("agent active context failed assistant tail stripped positionally", {
-			stopReason: tail.stopReason,
-			timestamp: tail.timestamp,
-		});
-		this.#host.agent.replaceMessages(messages.slice(0, -1));
+		let end = messages.length;
+		while (end > 0) {
+			const tail = messages[end - 1];
+			if (tail?.role !== "assistant") break;
+			const isFailedOrAborted = tail.stopReason === "error" || tail.stopReason === "aborted";
+			const isEmptyPlaceholder = !isFailedOrAborted && isEmptyAssistantStop(tail);
+			if (!isFailedOrAborted && !isEmptyPlaceholder) break;
+			logger.debug("agent active context failed assistant tail stripped positionally", {
+				stopReason: tail.stopReason,
+				timestamp: tail.timestamp,
+			});
+			end--;
+		}
+		if (end < messages.length) {
+			this.#host.agent.replaceMessages(messages.slice(0, end));
+		}
 	}
 
 	/**

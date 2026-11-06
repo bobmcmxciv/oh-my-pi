@@ -39,6 +39,7 @@ import {
 	type TspOp,
 } from "@oh-my-pi/pi-wire";
 import type { Terminal } from "../terminal";
+import { isSshSession } from "../terminal-capabilities";
 import {
 	bindTheme,
 	getCurrentThemeName,
@@ -178,7 +179,8 @@ class NativeContext implements DescribeContext {
 		this.reduceMotion = hello.reduceMotion === true;
 		this.dark = hello.dark !== false;
 		this.hour12 = hello.hour12;
-		this.#kinds = new Set(hello.kinds);
+		const remote = isSshSession();
+		this.#kinds = new Set(remote ? hello.kinds.filter(kind => kind !== "media") : hello.kinds);
 		this.#features = new Set(hello.features);
 	}
 
@@ -681,7 +683,7 @@ export class NativeBackend {
 			for (const blob of fresh) this.#sendBlob(blob);
 			return;
 		}
-		const dir = Bun.env.TERN_BLOB_DIR;
+		const dir = isSshSession() ? undefined : Bun.env.TERN_BLOB_DIR;
 		if (dir) {
 			for (const blob of fresh) this.#blobs.set(blob.id, blob);
 			void this.#cacheBlobs(dir, fresh);

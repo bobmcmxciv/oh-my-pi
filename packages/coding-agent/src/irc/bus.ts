@@ -12,7 +12,8 @@
 import { type IrcDeliveryReceipt, type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID, type TerminalAgentRef } from "../registry/agent-registry";
+import type { AgentSession } from "../session/agent-session";
 import type { CustomMessage } from "../session/messages";
 
 interface IrcWaiter {
@@ -30,6 +31,11 @@ interface SendMark {
 /** Mailbox cap per agent; oldest messages are dropped beyond it. */
 const MAILBOX_CAP = 100;
 
+function formatTerminalAgentError(id: string, terminal: TerminalAgentRef, detail?: string): string {
+	const reason = terminal.error ?? detail;
+	const suffix = reason ? ` (${reason})` : "";
+	return `Agent "${id}" has already ${terminal.outcome}${suffix} and is no longer running. Read agent://${id} or history://${id} for its output.`;
+}
 export class IrcBus {
 	static #global: IrcBus | undefined;
 
@@ -49,6 +55,7 @@ export class IrcBus {
 	readonly #lifecycle: () => AgentLifecycleManager;
 	readonly #mailboxes = new Map<string, IrcMessage[]>();
 	readonly #waiters = new Map<string, IrcWaiter[]>();
+	readonly #pendingStartMailboxes = new Map<string, IrcMessage[]>();
 	/** The latest successful send per `from` → `to`; see {@link sentSince}. */
 	readonly #lastSent = new Map<string, Map<string, SendMark>>();
 	/** The latest direct (non-broadcast) send per `from` → `to`; see {@link unansweredSends}. */
@@ -61,6 +68,9 @@ export class IrcBus {
 		// Lazy: the lifecycle global self-constructs against the global registry,
 		// so only touch it when a parked recipient actually needs reviving.
 		this.#lifecycle = () => lifecycle ?? AgentLifecycleManager.global();
+		this.#registry.onSessionAttached((ref, session) => {
+			void this.flushPendingStartMessages(ref.id, session);
+		});
 	}
 
 	/**
@@ -134,7 +144,27 @@ export class IrcBus {
 
 	async #deliver(message: IrcMessage, opts?: { suppressRelay?: boolean }): Promise<IrcDeliveryReceipt> {
 		const ref = this.#registry.get(message.to);
+		const pending = this.#registry.getPending(message.to);
+		if (pending) {
+			const waiter = this.#takeMatchingWaiter(message.to, message.from);
+			if (waiter) {
+				waiter.resolve(message);
+				if (!opts?.suppressRelay) this.#relayToMainUi(message);
+				return { to: message.to, outcome: "injected" };
+			}
+			this.#enqueuePendingStart(message);
+			if (!opts?.suppressRelay) this.#relayToMainUi(message);
+			return { to: message.to, outcome: "queued" };
+		}
 		if (!ref) {
+			const terminal = this.#registry.getTerminal(message.to);
+			if (terminal) {
+				return {
+					to: message.to,
+					outcome: "failed",
+					error: formatTerminalAgentError(message.to, terminal),
+				};
+			}
 			return {
 				to: message.to,
 				outcome: "failed",
@@ -176,10 +206,12 @@ export class IrcBus {
 			} catch (error) {
 				// Not revivable / released / revive failed. Do not buffer: a permanent
 				// failure must not inflate unread counts or pretend delivery is pending.
+				const terminal = this.#registry.getTerminal(message.to);
+				const rawError = error instanceof Error ? error.message : String(error);
 				return {
 					to: message.to,
 					outcome: "failed",
-					error: error instanceof Error ? error.message : String(error),
+					error: terminal ? formatTerminalAgentError(message.to, terminal, rawError) : rawError,
 				};
 			}
 		}
@@ -305,9 +337,51 @@ export class IrcBus {
 
 	/** Unread count for the local Agent Hub overlay. */
 	unreadCount(agentId: string): number {
-		return this.#mailboxes.get(agentId)?.length ?? 0;
+		return (this.#pendingStartMailboxes.get(agentId)?.length ?? 0) + (this.#mailboxes.get(agentId)?.length ?? 0);
 	}
 
+	/**
+	 * Deliver messages buffered for `agentId` while it was pending/queued once
+	 * its live `AgentSession` attaches.
+	 */
+	async flushPendingStartMessages(agentId: string, session?: AgentSession): Promise<number> {
+		const pending = this.#pendingStartMailboxes.get(agentId);
+		if (!pending || pending.length === 0) return 0;
+		this.#pendingStartMailboxes.delete(agentId);
+		const targetSession = session ?? this.#registry.get(agentId)?.session;
+		if (!targetSession) {
+			for (const msg of pending) this.#enqueuePendingStart(msg);
+			return 0;
+		}
+		let delivered = 0;
+		for (const msg of pending) {
+			const waiter = this.#takeMatchingWaiter(agentId, msg.from);
+			if (waiter) {
+				waiter.resolve(msg);
+				delivered++;
+				continue;
+			}
+			try {
+				await targetSession.deliverIrcMessage(msg, { preStart: !targetSession.isStreaming });
+				delivered++;
+			} catch {
+				this.#enqueue(msg);
+			}
+		}
+		return delivered;
+	}
+
+	#enqueuePendingStart(message: IrcMessage): void {
+		let mailbox = this.#pendingStartMailboxes.get(message.to);
+		if (!mailbox) {
+			mailbox = [];
+			this.#pendingStartMailboxes.set(message.to, mailbox);
+		}
+		mailbox.push(message);
+		if (mailbox.length > MAILBOX_CAP) {
+			mailbox.shift();
+		}
+	}
 	#enqueue(message: IrcMessage): void {
 		let mailbox = this.#mailboxes.get(message.to);
 		if (!mailbox) {
@@ -345,13 +419,16 @@ export class IrcBus {
 	}
 
 	#takeFromMailbox(agentId: string, from?: string): IrcMessage | undefined {
-		const mailbox = this.#mailboxes.get(agentId);
-		if (!mailbox) return undefined;
-		const index = from ? mailbox.findIndex(msg => msg.from === from) : 0;
-		if (index === -1 || mailbox.length === 0) return undefined;
-		const [message] = mailbox.splice(index, 1);
-		if (mailbox.length === 0) this.#mailboxes.delete(agentId);
-		return message;
+		for (const table of [this.#pendingStartMailboxes, this.#mailboxes]) {
+			const mailbox = table.get(agentId);
+			if (!mailbox) continue;
+			const index = from ? mailbox.findIndex(msg => msg.from === from) : 0;
+			if (index === -1 || mailbox.length === 0) continue;
+			const [message] = mailbox.splice(index, 1);
+			if (mailbox.length === 0) table.delete(agentId);
+			return message;
+		}
+		return undefined;
 	}
 
 	/**

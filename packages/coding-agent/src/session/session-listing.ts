@@ -8,6 +8,7 @@ import * as logger from "@oh-my-pi/pi-utils/logger";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { parseJsonlLenient } from "@oh-my-pi/pi-utils/stream";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
+import { stripXmlBlocks } from "../tiny/message-preproc";
 import { computeDefaultSessionDir } from "./session-paths";
 import { FileSessionStorage, type SessionStorage, type SessionStorageStat } from "./session-storage";
 import { lookupSessionTitle, recordSessionTitle } from "./session-index";
@@ -114,7 +115,12 @@ function getSessionScanCache(storage: SessionStorage): SessionScanCache {
 
 function sanitizeSessionName(value: string | undefined): string | undefined {
 	if (!value) return undefined;
-	const firstLine = value.split(/\r?\n/)[0] ?? "";
+	// Gateway-injected envelopes (`<hapi_user_context>…</hapi_user_context>`,
+	// `<system-reminder>…</system-reminder>`) wrap the real prompt in untitled
+	// sessions; strip paired XML before taking the first line, or the label
+	// degrades to a bare tag. Same policy as the tiny-title pipeline.
+	const xmlStripped = stripXmlBlocks(value);
+	const firstLine = xmlStripped.split(/\r?\n/).find(line => line.trim().length > 0) ?? "";
 	const stripped = firstLine.replace(/[\x00-\x1F\x7F]/g, "");
 	const trimmed = stripped.trim();
 	return trimmed.length > 0 ? trimmed : undefined;
@@ -715,7 +721,7 @@ export async function findMostRecentSession(
 }
 
 /** Session id embedded in a `<file-safe-timestamp>_<id>.jsonl` filename, if present. */
-function sessionIdFromSessionPath(file: string): string | undefined {
+export function sessionIdFromSessionPath(file: string): string | undefined {
 	const base = path.basename(file);
 	if (!base.endsWith(".jsonl")) return undefined;
 	const sep = base.lastIndexOf("_");

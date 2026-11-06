@@ -1317,7 +1317,15 @@ export function registerRpcPersistenceSurface(
 	});
 	const unsubscribeNotices = session.sessionManager.onPersistenceNotice(notice => {
 		const message = formatPersistenceNotice(notice);
-		output({ type: "notice", level: "warning", message, source: "session-persistence" });
+		output({
+			type: "notice",
+			level: "warning",
+			message,
+			source: "session-persistence",
+			reason: notice.reason,
+			from: notice.from,
+			to: notice.to,
+		});
 		process.stderr.write(`${message}\n`);
 	});
 	return () => {

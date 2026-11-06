@@ -59,7 +59,7 @@ import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pendi
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, type AgentTerminalOutcome, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import {
 	type CreateAgentSessionOptions,
@@ -4161,6 +4161,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	// Check if already aborted
 	if (signal?.aborted) {
+		AgentRegistry.global().recordTerminal({
+			id,
+			displayName: agent.name,
+			parentId: options.parentAgentId,
+			outcome: "aborted",
+			error: "Cancelled before start",
+		});
 		return {
 			index,
 			id,
@@ -5167,6 +5174,20 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		detached: options.detached,
 		sessionFile: subtaskSessionFile,
 		startTime,
+	});
+	const terminalOutcome: AgentTerminalOutcome = result.aborted
+		? "aborted"
+		: result.exitCode === 0 && !result.error
+			? "completed"
+			: "failed";
+	AgentRegistry.global().recordTerminal({
+		id,
+		displayName: agent.name,
+		parentId: options.parentAgentId,
+		outcome: terminalOutcome,
+		error: result.error ?? result.abortReason,
+		sessionFile: subtaskSessionFile ?? null,
+		outputPath: result.outputPath,
 	});
 	AgentRegistry.global().setHistory(id, { outputPath: result.outputPath });
 	return result;

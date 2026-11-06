@@ -187,6 +187,9 @@ export function resolveCmuxKind(
 	if (!parseFlag(env.PI_BROWSER_CMUX, options?.settingEnabled ?? true)) {
 		return null;
 	}
+	if (env.SSH_CONNECTION || env.SSH_TTY || env.SSH_CLIENT || env.CMUX_REMOTE_TRANSPORT === "ssh") {
+		return null;
+	}
 	const socketPath = env.CMUX_SOCKET_PATH;
 	if (!socketPath) {
 		return null;

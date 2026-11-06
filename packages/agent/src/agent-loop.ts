@@ -676,6 +676,36 @@ export function unpairedToolCallTail(messages: readonly AgentMessage[]): Assista
 }
 
 /**
+ * True when a trailing assistant message is an empty or failed/aborted
+ * placeholder with no runnable tool calls or substantive visible output.
+ */
+export function isRecoverableAssistantTailPlaceholder(message: AgentMessage | undefined): message is AssistantMessage {
+	if (message?.role !== "assistant") return false;
+	if (unpairedToolCallTail([message])) return false;
+	if (message.stopReason === "error" || message.stopReason === "aborted") return true;
+	return !message.content.some(
+		block =>
+			block.type === "toolCall" ||
+			block.type === "image" ||
+			block.type === "anthropicServerTool" ||
+			(block.type === "text" && block.text.trim().length > 0),
+	);
+}
+
+/**
+ * Strip trailing failed, aborted, or empty assistant placeholder messages when
+ * at least one earlier message remains in context to continue from.
+ */
+export function stripRecoverableAssistantTail(messages: readonly AgentMessage[]): AgentMessage[] | undefined {
+	if (messages.length <= 1) return undefined;
+	let end = messages.length;
+	while (end > 1 && isRecoverableAssistantTailPlaceholder(messages[end - 1])) {
+		end--;
+	}
+	return end < messages.length ? messages.slice(0, end) : undefined;
+}
+
+/**
  * Continue an agent loop from the current context without adding a new message.
  * Used for retries - context already has user message or tool results.
  *
@@ -695,8 +725,14 @@ export function agentLoopContinue(
 		throw new Error("Cannot continue: no messages in context");
 	}
 
-	if (context.messages[context.messages.length - 1].role === "assistant" && !unpairedToolCallTail(context.messages)) {
-		throw new Error("Cannot continue from message role: assistant");
+	let workingMessages = context.messages;
+	if (workingMessages[workingMessages.length - 1].role === "assistant" && !unpairedToolCallTail(workingMessages)) {
+		const stripped = stripRecoverableAssistantTail(workingMessages);
+		if (stripped && (stripped[stripped.length - 1].role !== "assistant" || unpairedToolCallTail(stripped))) {
+			workingMessages = stripped;
+		} else {
+			throw new Error("Cannot continue from message role: assistant");
+		}
 	}
 
 	const stream = createAgentStream();
@@ -704,8 +740,7 @@ export function agentLoopContinue(
 	(async () => {
 		try {
 			const newMessages: AgentMessage[] = [];
-			const currentContext: AgentContext = { ...context, messages: [...context.messages] };
-
+			const currentContext: AgentContext = { ...context, messages: [...workingMessages] };
 			const resumeTail = unpairedToolCallTail(currentContext.messages);
 			stream.push(
 				resumeTail

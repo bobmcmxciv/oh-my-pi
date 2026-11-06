@@ -509,6 +509,7 @@ console.log(JSON.stringify({ id: TERMINAL_ID, imageProtocol: TERMINAL.imageProto
 		expect(resolveWarpImageProtocol("linux", { WSL_INTEROP: "/run/WSL/1_interop" })).toBeNull();
 		expect(wslDistro.imageProtocol).toBeNull();
 		expect(wslInterop.imageProtocol).toBeNull();
+		expect(resolveWarpImageProtocol("linux", { SSH_CONNECTION: "10.0.0.1 1 10.0.0.2 22" })).toBeNull();
 	});
 
 	it("leaves synchronized output off by default and honors hyperlink force-on", () => {

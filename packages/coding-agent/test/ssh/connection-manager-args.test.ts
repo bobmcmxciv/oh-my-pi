@@ -7,6 +7,7 @@ import {
 	extractProbePayload,
 	findProbeMarker,
 	getHostInfo,
+	getHostInfoForHost,
 	HOST_PROBE_MARKER,
 	osFromUname,
 	parseHostInfo,
@@ -182,5 +183,30 @@ describe("parseHostInfo transferShell handling", () => {
 		// must be undefined so shouldRefreshHostInfo treats it as stale.
 		const parsed = parseHostInfo({ version: 3, os: "linux", shell: "sh", compatEnabled: false });
 		expect(parsed?.transferShell).toBeUndefined();
+	});
+
+	it("rejects cached host capabilities when the alias target changes", async () => {
+		const name = `omp-fp-${crypto.randomUUID()}`;
+		const file = path.join(getRemoteHostDir(), `${sanitizeHostName(name)}.json`);
+		await Bun.write(
+			file,
+			JSON.stringify({
+				version: 4,
+				os: "linux",
+				shell: "bash",
+				fingerprint: "alice@10.0.0.1:22",
+				transferShell: "bash",
+				compatEnabled: false,
+			}),
+		);
+		try {
+			expect(await getHostInfoForHost({ name, host: "10.0.0.1", username: "alice", port: 22 })).toMatchObject({
+				os: "linux",
+				transferShell: "bash",
+			});
+			expect(await getHostInfoForHost({ name, host: "10.0.0.2", username: "alice", port: 22 })).toBeUndefined();
+		} finally {
+			await fs.promises.rm(file, { force: true });
+		}
 	});
 });

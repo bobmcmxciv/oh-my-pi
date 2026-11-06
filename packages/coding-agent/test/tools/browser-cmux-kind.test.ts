@@ -47,4 +47,11 @@ describe("resolveCmuxKind", () => {
 	it("settings can disable cmux when the env override is unset", () => {
 		expect(resolveCmuxKind({ settingEnabled: false }, { CMUX_SOCKET_PATH: "/tmp/cmux.sock" })).toBeNull();
 	});
+
+	it("rejects forwarded cmux socket variables across SSH", () => {
+		expect(
+			resolveCmuxKind(null, { CMUX_SOCKET_PATH: "/tmp/cmux.sock", SSH_CONNECTION: "10.0.0.1 1 10.0.0.2 22" }),
+		).toBeNull();
+		expect(resolveCmuxKind(null, { CMUX_SOCKET_PATH: "/tmp/cmux.sock", CMUX_REMOTE_TRANSPORT: "ssh" })).toBeNull();
+	});
 });
